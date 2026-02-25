@@ -1,0 +1,6 @@
+train: ./images/train  # 训练集图像路径
+val: ./images/val      # 验证集图像路径
+test: ./images/test    # 测试集图像路径
+
+nc: 5
+names: ['Pneumonia Bacteria', 'Pneumonia Virus', 'Sick', 'healthy', 'tuberculosis']
