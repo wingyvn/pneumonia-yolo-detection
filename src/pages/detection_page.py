@@ -3,12 +3,12 @@
 ===========
 
 功能:
-    - 拖拽/按钮上传 X 光片
-    - 左右分栏: 原图 ↔ 检测标注图
-    - 检测结果详情面板（类别、置信度进度条、bbox 坐标）
-    - 批量检测（选择文件夹）
-    - 检测历史列表
-    - 单次检测可视化（热力图、面积占比、检测能力柱状图）+ 紫色导出按钮
+    - 单张/批量上传 X 光片
+    - QThread 异步检测（防止界面卡顿）
+    - 批量检测进度条 + 逐张结果展示
+    - 左侧结果列表 + 右侧图像对比区
+    - 检测详情表格、可视化图表、对照验证
+    - 紫色导出按钮
 """
 
 import os
@@ -16,15 +16,17 @@ import json
 import glob
 import numpy as np
 from datetime import datetime
+from collections import Counter, defaultdict
 
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QFileDialog, QScrollArea, QFrame, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
-    QGroupBox, QSizePolicy, QMessageBox, QTabWidget
+    QGroupBox, QSizePolicy, QMessageBox, QTabWidget,
+    QListWidget, QListWidgetItem
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QSize
-from PyQt5.QtGui import QPixmap, QImage, QFont, QColor, QPainter
+from PyQt5.QtCore import Qt, pyqtSignal, QThread, QSize
+from PyQt5.QtGui import QPixmap, QImage, QFont, QColor, QPainter, QIcon
 
 import matplotlib
 matplotlib.use('Agg')
@@ -36,23 +38,60 @@ from utils.db_manager import save_detection_record, get_user_settings
 
 
 def _fig_to_qpixmap(fig) -> QPixmap:
-    """将 matplotlib Figure 转换为 QPixmap（用于在 PyQt 中显示图表）"""
+    """将 matplotlib Figure 转换为 QPixmap"""
     canvas = FigureCanvasAgg(fig)
     canvas.draw()
-    # 获取 RGBA 缓冲区
     buf = canvas.buffer_rgba()
     w, h = canvas.get_width_height()
     qimg = QImage(buf, w, h, QImage.Format_RGBA8888)
     return QPixmap.fromImage(qimg)
 
 
-class DetectionPage(QWidget):
+# ============================================================
+# 检测工作线程 — 在后台执行 YOLO 推理，避免阻塞 UI
+# ============================================================
+
+class DetectionWorker(QThread):
     """
-    智能检测页面。
+    后台检测线程。
 
     信号:
-        detection_completed: 检测完成时发射，通知可视化页面刷新
+        progress(int, int, str): 当前进度(已完成数, 总数, 文件名)
+        result_ready(str, list, object): 单张检测完成(图片路径, 检测列表, 标注图numpy数组)
+        all_done: 全部检测完成
     """
+    progress = pyqtSignal(int, int, str)      # (当前, 总数, 文件名)
+    result_ready = pyqtSignal(str, list, object)  # (路径, 检测结果, 标注图)
+    all_done = pyqtSignal()
+
+    def __init__(self, detector, image_paths, conf, iou):
+        super().__init__()
+        self.detector = detector
+        self.image_paths = image_paths
+        self.conf = conf
+        self.iou = iou
+
+    def run(self):
+        """在子线程中逐张执行检测"""
+        total = len(self.image_paths)
+        for i, path in enumerate(self.image_paths):
+            try:
+                from PIL import Image
+                pil_image = Image.open(path)
+                detections, annotated = self.detector.detect(pil_image, self.conf, self.iou)
+                self.result_ready.emit(path, detections, annotated)
+            except Exception as e:
+                self.result_ready.emit(path, [], None)
+            self.progress.emit(i + 1, total, os.path.basename(path))
+        self.all_done.emit()
+
+
+# ============================================================
+# 检测页面主体
+# ============================================================
+
+class DetectionPage(QWidget):
+    """智能检测页面"""
 
     detection_completed = pyqtSignal()
 
@@ -60,31 +99,30 @@ class DetectionPage(QWidget):
         super().__init__()
         self.username = username
         self.detector = PneumoniaDetector()
-        self.current_detections = []        # 当前检测结果
-        self.current_image_path = None      # 当前图片路径
+        self.current_detections = []
+        self.current_image_path = None
+        # 批量检测结果存储: [{path, detections, annotated}, ...]
+        self.batch_results = []
+        self.worker = None
 
         self._load_model()
         self._init_ui()
 
     def _load_model(self):
         """加载模型"""
-        # 优先使用用户设置中的模型路径
         settings = get_user_settings(self.username)
         model_path = settings.get('model_path', '')
-
         if not model_path or not os.path.exists(model_path):
-            # 自动查找可用模型
             models = find_available_models()
             if models:
                 model_path = list(models.values())[0]
-
         if model_path:
             self.detector.load_model(model_path)
 
     def _init_ui(self):
         """构建检测页面布局"""
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 15, 20, 15)
+        layout.setContentsMargins(15, 10, 15, 10)
 
         # ========== 顶部工具栏 ==========
         toolbar = QHBoxLayout()
@@ -101,57 +139,119 @@ class DetectionPage(QWidget):
 
         toolbar.addStretch()
 
-        # 模型状态标签
+        # 进度条（默认隐藏）
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setFixedWidth(300)
+        self.progress_bar.setFixedHeight(26)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #D0D5DD;
+                border-radius: 6px;
+                background: #F5F5F5;
+                text-align: center;
+                font-size: 16px;
+            }
+            QProgressBar::chunk {
+                background: #42A5F5;
+                border-radius: 5px;
+            }
+        """)
+        toolbar.addWidget(self.progress_bar)
+
+        # 进度文字
+        self.progress_label = QLabel("")
+        self.progress_label.setStyleSheet("font-size: 16px; color: #666;")
+        self.progress_label.setVisible(False)
+        toolbar.addWidget(self.progress_label)
+
+        toolbar.addStretch()
+
         model_status = "✅ 模型已加载" if self.detector.is_loaded() else "❌ 模型未加载"
         self.model_label = QLabel(model_status)
-        self.model_label.setStyleSheet("color: #666; font-size: 12px;")
+        self.model_label.setStyleSheet("color: #666; font-size: 18px;")
         toolbar.addWidget(self.model_label)
 
         layout.addLayout(toolbar)
 
-        # ========== 主内容区 (上下分割) ==========
-        splitter = QSplitter(Qt.Vertical)
+        # ========== 主内容区 (左右 + 上下分割) ==========
+        main_splitter = QSplitter(Qt.Horizontal)
 
-        # --- 上半部: 图像对比区 ---
+        # --- 左侧: 结果列表（批量检测时显示每张图的缩略） ---
+        left_panel = QWidget()
+        left_layout = QVBoxLayout(left_panel)
+        left_layout.setContentsMargins(0, 0, 5, 0)
+
+        list_title = QLabel("📋 检测结果列表")
+        list_title.setStyleSheet("font-size: 18px; font-weight: bold; color: #1A237E;")
+        left_layout.addWidget(list_title)
+
+        self.result_list = QListWidget()
+        self.result_list.setStyleSheet("""
+            QListWidget {
+                background: white;
+                border: 1px solid #E0E0E0;
+                border-radius: 8px;
+                font-size: 17px;
+                font-family: "Microsoft YaHei";
+            }
+            QListWidget::item {
+                padding: 8px 10px;
+                border-bottom: 1px solid #F0F0F0;
+            }
+            QListWidget::item:selected {
+                background: #E3F2FD;
+                color: #1565C0;
+            }
+        """)
+        self.result_list.currentRowChanged.connect(self._on_result_selected)
+        left_layout.addWidget(self.result_list)
+
+        left_panel.setFixedWidth(260)
+        main_splitter.addWidget(left_panel)
+
+        # --- 右侧: 图像对比 + 详情 ---
+        right_panel = QWidget()
+        right_layout = QVBoxLayout(right_panel)
+        right_layout.setContentsMargins(5, 0, 0, 0)
+
+        right_splitter = QSplitter(Qt.Vertical)
+
+        # -- 图像对比区 --
         image_area = QWidget()
         image_layout = QHBoxLayout(image_area)
-        image_layout.setSpacing(15)
+        image_layout.setSpacing(12)
 
-        # 左: 原图
         left_group = QGroupBox("📷 原始 X 光片")
-        left_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; }")
         left_inner = QVBoxLayout(left_group)
         self.label_original = QLabel("请上传 X 光片图像")
         self.label_original.setAlignment(Qt.AlignCenter)
-        self.label_original.setMinimumSize(400, 350)
+        self.label_original.setMinimumSize(350, 300)
         self.label_original.setStyleSheet(
             "background: #FAFAFA; border: 2px dashed #CCC; border-radius: 10px; "
-            "color: #999; font-size: 14px;"
+            "color: #999; font-size: 20px;"
         )
         left_inner.addWidget(self.label_original)
         image_layout.addWidget(left_group)
 
-        # 右: 检测结果图
         right_group = QGroupBox("🔍 检测结果")
-        right_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; }")
         right_inner = QVBoxLayout(right_group)
         self.label_result = QLabel("检测结果将显示在这里")
         self.label_result.setAlignment(Qt.AlignCenter)
-        self.label_result.setMinimumSize(400, 350)
+        self.label_result.setMinimumSize(350, 300)
         self.label_result.setStyleSheet(
             "background: #FAFAFA; border: 2px dashed #CCC; border-radius: 10px; "
-            "color: #999; font-size: 14px;"
+            "color: #999; font-size: 20px;"
         )
         right_inner.addWidget(self.label_result)
         image_layout.addWidget(right_group)
 
-        splitter.addWidget(image_area)
+        right_splitter.addWidget(image_area)
 
-        # --- 下半部: 结果详情 + 单次检测可视化 ---
+        # -- 下半部: Tab 页 --
         bottom_tabs = QTabWidget()
-        bottom_tabs.setStyleSheet("QTabWidget { font-size: 12px; }")
 
-        # Tab 1: 检测详情表格
+        # Tab 1: 检测详情
         detail_widget = QWidget()
         detail_layout = QVBoxLayout(detail_widget)
         self.result_table = QTableWidget(0, 6)
@@ -160,71 +260,56 @@ class DetectionPage(QWidget):
         )
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.result_table.setAlternatingRowColors(True)
-        self.result_table.setStyleSheet(
-            "QTableWidget { background: white; gridline-color: #E0E0E0; }"
-            "QHeaderView::section { background: #E3F2FD; font-weight: bold; padding: 6px; }"
-        )
+        self.result_table.setStyleSheet("""
+            QTableWidget { background: white; gridline-color: #E0E0E0; font-size: 17px; }
+            QHeaderView::section { background: #E3F2FD; font-weight: bold; padding: 8px; font-size: 17px; }
+        """)
         detail_layout.addWidget(self.result_table)
         bottom_tabs.addTab(detail_widget, "📋 检测详情")
 
-        # Tab 2: 单次检测可视化
+        # Tab 2: 可视化图表
         vis_widget = QWidget()
         vis_layout = QVBoxLayout(vis_widget)
-
-        # 三张图表水平排列
         charts_layout = QHBoxLayout()
+
         self.chart_heatmap = QLabel("待检测")
         self.chart_heatmap.setAlignment(Qt.AlignCenter)
-        self.chart_heatmap.setMinimumHeight(220)
+        self.chart_heatmap.setMinimumHeight(200)
         self.chart_heatmap.setStyleSheet("background: white; border: 1px solid #E0E0E0; border-radius: 6px;")
         charts_layout.addWidget(self.chart_heatmap)
 
         self.chart_area = QLabel("待检测")
         self.chart_area.setAlignment(Qt.AlignCenter)
-        self.chart_area.setMinimumHeight(220)
+        self.chart_area.setMinimumHeight(200)
         self.chart_area.setStyleSheet("background: white; border: 1px solid #E0E0E0; border-radius: 6px;")
         charts_layout.addWidget(self.chart_area)
 
         self.chart_capability = QLabel("待检测")
         self.chart_capability.setAlignment(Qt.AlignCenter)
-        self.chart_capability.setMinimumHeight(220)
+        self.chart_capability.setMinimumHeight(200)
         self.chart_capability.setStyleSheet("background: white; border: 1px solid #E0E0E0; border-radius: 6px;")
         charts_layout.addWidget(self.chart_capability)
 
         vis_layout.addLayout(charts_layout)
 
-        # 紫色导出按钮
         export_layout = QHBoxLayout()
         export_layout.addStretch()
-
-        self.btn_export_heatmap = QPushButton("导出热力图")
-        self.btn_export_heatmap.setObjectName("exportButton")
-        self.btn_export_heatmap.clicked.connect(lambda: self._export_chart('heatmap'))
-        export_layout.addWidget(self.btn_export_heatmap)
-
-        self.btn_export_area = QPushButton("导出面积占比")
-        self.btn_export_area.setObjectName("exportButton")
-        self.btn_export_area.clicked.connect(lambda: self._export_chart('area'))
-        export_layout.addWidget(self.btn_export_area)
-
-        self.btn_export_capability = QPushButton("导出检测能力")
-        self.btn_export_capability.setObjectName("exportButton")
-        self.btn_export_capability.clicked.connect(lambda: self._export_chart('capability'))
-        export_layout.addWidget(self.btn_export_capability)
-
+        for label, key in [("导出热力图", "heatmap"), ("导出面积占比", "area"), ("导出检测能力", "capability")]:
+            btn = QPushButton(label)
+            btn.setObjectName("exportButton")
+            btn.clicked.connect(lambda checked, k=key: self._export_chart(k))
+            export_layout.addWidget(btn)
         export_layout.addStretch()
         vis_layout.addLayout(export_layout)
-
         bottom_tabs.addTab(vis_widget, "📊 检测可视化")
 
-        # Tab 3: 对照验证（真实标注 vs 模型预测）
+        # Tab 3: 对照验证
         compare_widget = QWidget()
         compare_layout = QVBoxLayout(compare_widget)
 
         compare_title = QLabel("📝 自动对照验证: 模型预测 vs 真实标注")
         compare_title.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #1A237E; "
-            "font-family: 'Microsoft YaHei'; margin-bottom: 5px;"
+            "font-size: 20px; font-weight: bold; color: #1A237E; margin-bottom: 5px;"
         )
         compare_layout.addWidget(compare_title)
 
@@ -232,373 +317,350 @@ class DetectionPage(QWidget):
             "系统自动查找上传图片对应的真实标注文件（labels/test 或 labels/val），"
             "将医学专家标注与模型预测结果进行自动比对。"
         )
-        compare_desc.setStyleSheet("color: #666; font-size: 12px; margin-bottom: 10px;")
+        compare_desc.setStyleSheet("color: #666; font-size: 17px; margin-bottom: 10px;")
         compare_desc.setWordWrap(True)
         compare_layout.addWidget(compare_desc)
 
-        # 对照结果显示区域
         self.compare_result = QLabel("请先执行检测")
         self.compare_result.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.compare_result.setWordWrap(True)
-        self.compare_result.setMinimumHeight(180)
+        self.compare_result.setMinimumHeight(160)
         self.compare_result.setStyleSheet(
             "background: white; border: 1px solid #E0E0E0; border-radius: 8px; "
-            "padding: 15px; font-size: 13px; font-family: 'Microsoft YaHei'; line-height: 1.8;"
+            "padding: 15px; font-size: 18px; font-family: 'Microsoft YaHei';"
         )
         compare_layout.addWidget(self.compare_result)
-
         bottom_tabs.addTab(compare_widget, "✅ 对照验证")
 
-        splitter.addWidget(bottom_tabs)
-        splitter.setSizes([450, 300])
+        right_splitter.addWidget(bottom_tabs)
+        right_splitter.setSizes([400, 300])
 
-        layout.addWidget(splitter)
+        right_layout.addWidget(right_splitter)
+        main_splitter.addWidget(right_panel)
 
-        # 应用页面样式
+        layout.addWidget(main_splitter)
         self.setStyleSheet(self._get_stylesheet())
 
     # ============================================================
-    # 图片选择与检测
+    # 图片选择与检测入口
     # ============================================================
 
     def _select_image(self):
-        """打开文件对话框选择单张图片"""
+        """选择单张图片"""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "选择 X 光片",
-            "",
+            self, "选择 X 光片", "",
             "图像文件 (*.jpg *.jpeg *.png *.bmp);;所有文件 (*)"
         )
         if file_path:
-            self._run_detection(file_path)
+            self._start_detection([file_path])
 
     def _batch_detect(self):
-        """批量检测: 选择文件夹并处理所有图片"""
+        """批量检测: 选择文件夹"""
         folder = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
         if not folder:
             return
-
-        # 收集所有图片文件
         extensions = ('.jpg', '.jpeg', '.png', '.bmp')
-        image_files = [
+        image_files = sorted([
             os.path.join(folder, f)
             for f in os.listdir(folder)
             if f.lower().endswith(extensions)
-        ]
-
+        ])
         if not image_files:
             QMessageBox.information(self, "提示", "所选文件夹中没有图片文件")
             return
+        self._start_detection(image_files)
 
-        # 逐张处理
-        for i, file_path in enumerate(image_files):
-            self._run_detection(file_path)
-
-        QMessageBox.information(
-            self, "批量检测完成",
-            f"共处理 {len(image_files)} 张图片，结果已保存到数据库"
-        )
-
-    def _run_detection(self, image_path: str):
+    def _start_detection(self, image_paths: list):
         """
-        对单张图片执行检测并更新界面。
+        启动异步检测（QThread）。
 
         Args:
-            image_path: 图片文件路径
+            image_paths: 图片路径列表
         """
         if not self.detector.is_loaded():
             QMessageBox.warning(self, "错误", "模型未加载，请在设置页指定模型路径")
             return
+        if self.worker and self.worker.isRunning():
+            QMessageBox.warning(self, "提示", "检测仍在进行中，请等待完成")
+            return
 
-        self.current_image_path = image_path
+        # 重置批量结果
+        self.batch_results = []
+        self.result_list.clear()
 
-        # 获取用户设置的阈值
+        # 获取阈值
         settings = get_user_settings(self.username)
         conf = settings.get('conf_threshold', 0.25)
         iou = settings.get('iou_threshold', 0.45)
 
-        from PIL import Image
-        pil_image = Image.open(image_path)
+        # 显示进度条
+        self.progress_bar.setMaximum(len(image_paths))
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_label.setText(f"检测中 0/{len(image_paths)}...")
+        self.btn_select.setEnabled(False)
+        self.btn_batch.setEnabled(False)
 
-        # 执行检测
-        detections, annotated = self.detector.detect(pil_image, conf=conf, iou=iou)
+        # 创建并启动工作线程
+        self.worker = DetectionWorker(self.detector, image_paths, conf, iou)
+        self.worker.progress.connect(self._on_progress)
+        self.worker.result_ready.connect(self._on_single_result)
+        self.worker.all_done.connect(self._on_all_done)
+        self.worker.start()
+
+    # ============================================================
+    # 工作线程回调
+    # ============================================================
+
+    def _on_progress(self, current, total, filename):
+        """更新进度条"""
+        self.progress_bar.setValue(current)
+        self.progress_label.setText(f"检测中 {current}/{total} — {filename}")
+
+    def _on_single_result(self, image_path, detections, annotated):
+        """
+        每检测完一张图片时调用:
+            - 存入 batch_results
+            - 添加到左侧列表
+            - 如果是第一张或当前选中的，自动刷新右侧显示
+        """
+        result = {
+            'path': image_path,
+            'detections': detections,
+            'annotated': annotated
+        }
+        self.batch_results.append(result)
+
+        # 添加到列表
+        name = os.path.basename(image_path)
+        n = len(detections)
+        status = f"✅ {n} 个目标" if n > 0 else "✔ 正常"
+        item = QListWidgetItem(f"{name}\n   {status}")
+        self.result_list.addItem(item)
+
+        # 自动选中最新的一项（实时刷新右侧）
+        self.result_list.setCurrentRow(self.result_list.count() - 1)
+
+        # 保存到数据库
+        settings = get_user_settings(self.username)
+        save_detection_record(
+            username=self.username,
+            image_name=name,
+            image_path=image_path,
+            detections=detections,
+            conf_threshold=settings.get('conf_threshold', 0.25),
+            iou_threshold=settings.get('iou_threshold', 0.45)
+        )
+
+    def _on_all_done(self):
+        """全部检测完成"""
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+        self.btn_select.setEnabled(True)
+        self.btn_batch.setEnabled(True)
+        self.detection_completed.emit()
+
+        total = len(self.batch_results)
+        if total > 1:
+            QMessageBox.information(
+                self, "批量检测完成",
+                f"共处理 {total} 张图片，点击左侧列表可查看每张结果"
+            )
+
+    # ============================================================
+    # 列表项点击 — 切换显示
+    # ============================================================
+
+    def _on_result_selected(self, row):
+        """用户在左侧列表点击某一项时，更新右侧所有内容"""
+        if row < 0 or row >= len(self.batch_results):
+            return
+
+        result = self.batch_results[row]
+        image_path = result['path']
+        detections = result['detections']
+        annotated = result['annotated']
+
+        self.current_image_path = image_path
         self.current_detections = detections
 
-        # ---------- 更新原图显示 ----------
+        # 更新原图
         pixmap_orig = QPixmap(image_path)
-        scaled_orig = pixmap_orig.scaled(
+        self.label_original.setPixmap(pixmap_orig.scaled(
             self.label_original.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        )
-        self.label_original.setPixmap(scaled_orig)
+        ))
         self.label_original.setStyleSheet("background: #FAFAFA; border-radius: 10px;")
 
-        # ---------- 更新检测结果图 ----------
+        # 更新检测结果图
         if annotated is not None:
             h, w, ch = annotated.shape
             qimg = QImage(annotated.data, w, h, ch * w, QImage.Format_RGB888)
-            pixmap_result = QPixmap.fromImage(qimg)
-            scaled_result = pixmap_result.scaled(
+            self.label_result.setPixmap(QPixmap.fromImage(qimg).scaled(
                 self.label_result.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            self.label_result.setPixmap(scaled_result)
+            ))
             self.label_result.setStyleSheet("background: #FAFAFA; border-radius: 10px;")
         else:
             self.label_result.setText("✅ 未检测到异常")
 
-        # ---------- 更新详情表格 ----------
+        # 更新详情表格
         self._update_result_table(detections)
-
-        # ---------- 更新单次检测可视化图表 ----------
+        # 更新可视化图表
         self._update_detection_charts(detections)
-
-        # ---------- 更新对照验证 ----------
+        # 更新对照验证
         self._update_comparison(image_path, detections)
 
-        # ---------- 保存检测记录到数据库 ----------
-        save_detection_record(
-            username=self.username,
-            image_name=os.path.basename(image_path),
-            image_path=image_path,
-            detections=detections,
-            conf_threshold=conf,
-            iou_threshold=iou
-        )
-
-        # 通知可视化页面刷新
-        self.detection_completed.emit()
-
     # ============================================================
-    # 界面更新方法
+    # 界面更新
     # ============================================================
 
     def _update_result_table(self, detections: list):
         """更新检测详情表格"""
         self.result_table.setRowCount(len(detections))
-
         for row, det in enumerate(detections):
-            # 类别（英文）
             self.result_table.setItem(row, 0, QTableWidgetItem(det['class_name']))
-
-            # 类别（中文）
             self.result_table.setItem(row, 1, QTableWidgetItem(det['class_name_cn']))
 
-            # 置信度数值
             conf_item = QTableWidgetItem(f"{det['confidence']:.4f}")
             conf_item.setTextAlignment(Qt.AlignCenter)
             self.result_table.setItem(row, 2, conf_item)
 
-            # Bbox 坐标
             bbox = det['bbox']
-            bbox_str = f"({bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f})"
-            self.result_table.setItem(row, 3, QTableWidgetItem(bbox_str))
+            self.result_table.setItem(row, 3, QTableWidgetItem(
+                f"({bbox[0]:.0f}, {bbox[1]:.0f}, {bbox[2]:.0f}, {bbox[3]:.0f})"
+            ))
 
-            # 面积占比
             area_item = QTableWidgetItem(f"{det['area_ratio']:.2%}")
             area_item.setTextAlignment(Qt.AlignCenter)
             self.result_table.setItem(row, 4, area_item)
 
-            # 置信度进度条
             bar = QProgressBar()
             bar.setRange(0, 100)
             bar.setValue(int(det['confidence'] * 100))
             bar.setFormat(f"{det['confidence']:.1%}")
-            # 根据置信度设置颜色
+            bar.setFixedHeight(22)
             if det['confidence'] >= 0.8:
-                bar.setStyleSheet("QProgressBar::chunk { background: #43A047; }")
+                bar.setStyleSheet("QProgressBar::chunk { background: #43A047; } QProgressBar { font-size: 15px; }")
             elif det['confidence'] >= 0.5:
-                bar.setStyleSheet("QProgressBar::chunk { background: #FF9800; }")
+                bar.setStyleSheet("QProgressBar::chunk { background: #FF9800; } QProgressBar { font-size: 15px; }")
             else:
-                bar.setStyleSheet("QProgressBar::chunk { background: #E53935; }")
+                bar.setStyleSheet("QProgressBar::chunk { background: #E53935; } QProgressBar { font-size: 15px; }")
             self.result_table.setCellWidget(row, 5, bar)
 
     def _update_detection_charts(self, detections: list):
-        """
-        为当前检测结果生成三张可视化图表。
-        """
+        """为当前检测结果生成三张可视化图表"""
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
         plt.rcParams['axes.unicode_minus'] = False
 
-        # --- 1. 目标位置热力图 ---
-        self._current_fig_heatmap = self._create_heatmap_chart(detections)
-        self.chart_heatmap.setPixmap(
-            _fig_to_qpixmap(self._current_fig_heatmap).scaled(
-                self.chart_heatmap.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-        )
-        plt.close(self._current_fig_heatmap)
+        fig1 = self._create_heatmap_chart(detections)
+        self.chart_heatmap.setPixmap(_fig_to_qpixmap(fig1).scaled(
+            self.chart_heatmap.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        plt.close(fig1)
 
-        # --- 2. 目标面积占比 ---
-        self._current_fig_area = self._create_area_chart(detections)
-        self.chart_area.setPixmap(
-            _fig_to_qpixmap(self._current_fig_area).scaled(
-                self.chart_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-        )
-        plt.close(self._current_fig_area)
+        fig2 = self._create_area_chart(detections)
+        self.chart_area.setPixmap(_fig_to_qpixmap(fig2).scaled(
+            self.chart_area.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        plt.close(fig2)
 
-        # --- 3. 检测能力柱状图 ---
-        self._current_fig_capability = self._create_capability_chart(detections)
-        self.chart_capability.setPixmap(
-            _fig_to_qpixmap(self._current_fig_capability).scaled(
-                self.chart_capability.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-        )
-        plt.close(self._current_fig_capability)
+        fig3 = self._create_capability_chart(detections)
+        self.chart_capability.setPixmap(_fig_to_qpixmap(fig3).scaled(
+            self.chart_capability.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        plt.close(fig3)
 
     # ============================================================
-    # 图表生成方法
+    # 图表生成
     # ============================================================
 
-    def _create_heatmap_chart(self, detections: list):
-        """
-        目标位置热力图: 将检测到的 bbox 中心映射到图像坐标系，
-        用热力图展示病灶分布位置。
-        """
+    def _create_heatmap_chart(self, detections):
         fig, ax = plt.subplots(figsize=(4, 3.2), dpi=100)
-
         if detections:
-            # 提取归一化中心坐标
             xs = [d['bbox_norm'][0] for d in detections]
             ys = [d['bbox_norm'][1] for d in detections]
-
-            # 创建热力网格
             grid_size = 50
             heatmap = np.zeros((grid_size, grid_size))
             for x, y in zip(xs, ys):
                 gx = min(int(x * grid_size), grid_size - 1)
                 gy = min(int(y * grid_size), grid_size - 1)
                 heatmap[gy, gx] += 1
-
-            # 高斯模糊使热力图更平滑
             from scipy.ndimage import gaussian_filter
             heatmap = gaussian_filter(heatmap, sigma=3)
-
             ax.imshow(heatmap, cmap='hot', interpolation='bilinear', aspect='auto')
-            ax.set_title('目标位置热力图', fontsize=11, fontweight='bold')
+            ax.set_title('目标位置热力图', fontsize=12, fontweight='bold')
         else:
-            ax.text(0.5, 0.5, '暂无检测数据', ha='center', va='center',
-                    fontsize=12, color='#999', transform=ax.transAxes)
-            ax.set_title('目标位置热力图', fontsize=11, fontweight='bold')
-
-        ax.set_xlabel('X 方向')
-        ax.set_ylabel('Y 方向')
+            ax.text(0.5, 0.5, '暂无检测数据', ha='center', va='center', fontsize=13, color='#999', transform=ax.transAxes)
+            ax.set_title('目标位置热力图', fontsize=12, fontweight='bold')
+        ax.set_xlabel('X 方向', fontsize=10)
+        ax.set_ylabel('Y 方向', fontsize=10)
         plt.tight_layout()
         return fig
 
-    def _create_area_chart(self, detections: list):
-        """
-        目标面积占比: 饼图展示各检测目标的面积在图像中的占比。
-        """
+    def _create_area_chart(self, detections):
         fig, ax = plt.subplots(figsize=(4, 3.2), dpi=100)
-
         if detections:
-            labels = [f"{d['class_name_cn']}" for d in detections]
+            labels = [d['class_name_cn'] for d in detections]
             areas = [d['area_ratio'] * 100 for d in detections]
-            # 剩余区域（无检测）
             remaining = max(0, 100 - sum(areas))
             labels.append('无病灶区域')
             areas.append(remaining)
-
             colors = []
             for d in detections:
                 cid = d['class_id']
                 c = CLASS_COLORS[cid] if cid < len(CLASS_COLORS) else (150, 150, 150)
                 colors.append(f'#{c[0]:02x}{c[1]:02x}{c[2]:02x}')
-            colors.append('#E0E0E0')  # 灰色表示无病灶区域
-
-            wedges, texts, autotexts = ax.pie(
-                areas, labels=labels, colors=colors,
-                autopct='%1.1f%%', startangle=90,
-                textprops={'fontsize': 8}
-            )
-            ax.set_title('目标面积占比', fontsize=11, fontweight='bold')
+            colors.append('#E0E0E0')
+            ax.pie(areas, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90, textprops={'fontsize': 9})
+            ax.set_title('目标面积占比', fontsize=12, fontweight='bold')
         else:
-            ax.text(0.5, 0.5, '暂无检测数据', ha='center', va='center',
-                    fontsize=12, color='#999', transform=ax.transAxes)
-            ax.set_title('目标面积占比', fontsize=11, fontweight='bold')
-
+            ax.text(0.5, 0.5, '暂无检测数据', ha='center', va='center', fontsize=13, color='#999', transform=ax.transAxes)
+            ax.set_title('目标面积占比', fontsize=12, fontweight='bold')
         plt.tight_layout()
         return fig
 
-    def _create_capability_chart(self, detections: list):
-        """
-        检测能力柱状图: 展示每个类别的检出数量和平均置信度。
-        """
+    def _create_capability_chart(self, detections):
         fig, ax = plt.subplots(figsize=(4, 3.2), dpi=100)
-
         if detections:
-            # 按类别统计
-            from collections import Counter, defaultdict
             class_counts = Counter()
             class_conf_sum = defaultdict(float)
-
             for d in detections:
                 name = d['class_name_cn']
                 class_counts[name] += 1
                 class_conf_sum[name] += d['confidence']
-
             names = list(class_counts.keys())
             counts = [class_counts[n] for n in names]
             avg_confs = [class_conf_sum[n] / class_counts[n] for n in names]
-
             x = np.arange(len(names))
-            bar_width = 0.35
-
-            bars1 = ax.bar(x - bar_width / 2, counts, bar_width,
-                           label='检出数量', color='#42A5F5')
-            bars2 = ax.bar(x + bar_width / 2, avg_confs, bar_width,
-                           label='平均置信度', color='#66BB6A')
-
-            # 标注数值
-            for bar in bars1:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.05,
-                        f'{int(bar.get_height())}', ha='center', fontsize=8)
-            for bar in bars2:
-                ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.02,
-                        f'{bar.get_height():.2f}', ha='center', fontsize=8)
-
+            w = 0.35
+            ax.bar(x - w/2, counts, w, label='检出数量', color='#42A5F5')
+            ax.bar(x + w/2, avg_confs, w, label='平均置信度', color='#66BB6A')
+            for i, (c, a) in enumerate(zip(counts, avg_confs)):
+                ax.text(i - w/2, c + 0.05, str(c), ha='center', fontsize=9)
+                ax.text(i + w/2, a + 0.02, f'{a:.2f}', ha='center', fontsize=9)
             ax.set_xticks(x)
-            ax.set_xticklabels(names, fontsize=9)
-            ax.legend(fontsize=8)
-            ax.set_title('检测能力柱状图', fontsize=11, fontweight='bold')
+            ax.set_xticklabels(names, fontsize=10)
+            ax.legend(fontsize=9)
+            ax.set_title('检测能力柱状图', fontsize=12, fontweight='bold')
         else:
-            ax.text(0.5, 0.5, '暂无检测数据', ha='center', va='center',
-                    fontsize=12, color='#999', transform=ax.transAxes)
-            ax.set_title('检测能力柱状图', fontsize=11, fontweight='bold')
-
+            ax.text(0.5, 0.5, '暂无检测数据', ha='center', va='center', fontsize=13, color='#999', transform=ax.transAxes)
+            ax.set_title('检测能力柱状图', fontsize=12, fontweight='bold')
         ax.grid(axis='y', alpha=0.3)
         plt.tight_layout()
         return fig
 
     # ============================================================
-    # 对照验证（自动查找真实标注并比对）
+    # 对照验证
     # ============================================================
 
     def _find_label_file(self, image_path: str) -> str:
-        """
-        根据图片路径自动查找对应的标签文件。
-
-        搜索策略:
-            1. 根据图片路径判断属于 train/val/test 哪个集
-            2. 在 labels 目录下查找同名 .txt 文件
-            3. 如果在 images/test 下找不到，尝试遍历所有 labels 子目录
-
-        Returns:
-            标签文件路径，未找到返回 ''
-        """
-        # 获取图片文件名（不含扩展名）
+        """根据图片路径自动查找对应的 YOLO 标签文件"""
         img_stem = os.path.splitext(os.path.basename(image_path))[0]
-
-        # 尝试从图片路径推断数据集位置
         img_dir = os.path.dirname(image_path)
-        parent_dir = os.path.dirname(img_dir)  # images 的父目录
-        dir_name = os.path.basename(img_dir)     # test / val / train
+        parent_dir = os.path.dirname(img_dir)
+        dir_name = os.path.basename(img_dir)
 
-        # 方案 1: images/test -> labels/test
         label_path = os.path.join(parent_dir.replace('images', 'labels'), dir_name, img_stem + '.txt')
         if os.path.exists(label_path):
             return label_path
 
-        # 方案 2: 遍历 workspace/labels 下所有子目录
         workspace_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         labels_root = os.path.join(workspace_dir, 'labels')
         if os.path.isdir(labels_root):
@@ -606,16 +668,10 @@ class DetectionPage(QWidget):
                 candidate = os.path.join(labels_root, split, img_stem + '.txt')
                 if os.path.exists(candidate):
                     return candidate
-
         return ''
 
     def _parse_label_file(self, label_path: str) -> list:
-        """
-        解析 YOLO 格式标签文件。
-
-        Returns:
-            列表，每个元素为 {'class_id': int, 'class_name': str, 'class_name_cn': str}
-        """
+        """解析 YOLO 格式标签文件"""
         ground_truths = []
         try:
             with open(label_path, 'r') as f:
@@ -633,49 +689,37 @@ class DetectionPage(QWidget):
         return ground_truths
 
     def _update_comparison(self, image_path: str, detections: list):
-        """
-        对照验证: 自动查找标签文件，将真实标注与模型预测结果进行比对。
-        """
+        """对照验证: 自动查找标签文件并与预测结果比对"""
         label_path = self._find_label_file(image_path)
 
         if not label_path:
             self.compare_result.setText(
-                '<p style="color:#FF9800; font-size:14px;">⚠️ <b>未找到对应的标签文件</b></p>'
-                '<p>请使用 images/test 或 images/val 目录中的图片进行对照验证。</p>'
-                '<p>系统会自动在 labels/ 目录下查找同名的 .txt 标注文件。</p>'
+                '<p style="color:#FF9800; font-size:19px;">⚠️ <b>未找到对应的标签文件</b></p>'
+                '<p style="font-size:17px;">请使用 images/test 或 images/val 目录中的图片进行对照验证。</p>'
             )
             return
 
-        # 解析真实标注
         ground_truths = self._parse_label_file(label_path)
-
-        # 林列比对结果
-        from collections import Counter
         gt_classes = Counter(gt['class_name_cn'] for gt in ground_truths)
         pred_classes = Counter(d['class_name_cn'] for d in detections)
 
-        html = '<table style="width:100%; border-collapse:collapse; font-size:13px;">'
+        html = '<table style="width:100%; border-collapse:collapse; font-size:17px;">'
         html += '<tr style="background:#E3F2FD; font-weight:bold;">'
-        html += '<td style="padding:8px; border:1px solid #E0E0E0;">项目</td>'
-        html += '<td style="padding:8px; border:1px solid #E0E0E0;">真实标注 (Ground Truth)</td>'
-        html += '<td style="padding:8px; border:1px solid #E0E0E0;">模型预测 (Prediction)</td>'
-        html += '<td style="padding:8px; border:1px solid #E0E0E0;">结果</td>'
+        html += '<td style="padding:10px; border:1px solid #E0E0E0;">项目</td>'
+        html += '<td style="padding:10px; border:1px solid #E0E0E0;">真实标注 (GT)</td>'
+        html += '<td style="padding:10px; border:1px solid #E0E0E0;">模型预测</td>'
+        html += '<td style="padding:10px; border:1px solid #E0E0E0;">结果</td>'
         html += '</tr>'
 
-        # 标注来源
-        html += f'<tr><td style="padding:8px; border:1px solid #E0E0E0;">标注文件</td>'
-        html += f'<td style="padding:8px; border:1px solid #E0E0E0; color:#666;" colspan="3">{os.path.basename(label_path)}</td></tr>'
+        html += f'<tr><td style="padding:10px; border:1px solid #E0E0E0;">标注文件</td>'
+        html += f'<td style="padding:10px; border:1px solid #E0E0E0; color:#666;" colspan="3">{os.path.basename(label_path)}</td></tr>'
 
-        # 检测数戮
-        html += f'<tr><td style="padding:8px; border:1px solid #E0E0E0;">目标数量</td>'
-        html += f'<td style="padding:8px; border:1px solid #E0E0E0;">{len(ground_truths)} 个</td>'
-        html += f'<td style="padding:8px; border:1px solid #E0E0E0;">{len(detections)} 个</td>'
+        html += f'<tr><td style="padding:10px; border:1px solid #E0E0E0;">目标数量</td>'
+        html += f'<td style="padding:10px; border:1px solid #E0E0E0;">{len(ground_truths)} 个</td>'
+        html += f'<td style="padding:10px; border:1px solid #E0E0E0;">{len(detections)} 个</td>'
         count_match = len(ground_truths) == len(detections)
-        html += f'<td style="padding:8px; border:1px solid #E0E0E0;">'
-        html += '✅ 一致' if count_match else '⚠️ 不一致'
-        html += '</td></tr>'
+        html += f'<td style="padding:10px; border:1px solid #E0E0E0;">{"✅ 一致" if count_match else "⚠️ 不一致"}</td></tr>'
 
-        # 按类别对比
         all_classes = set(list(gt_classes.keys()) + list(pred_classes.keys()))
         correct_count = 0
         total_classes = len(all_classes) if all_classes else 1
@@ -686,37 +730,22 @@ class DetectionPage(QWidget):
             match = gt_count == pred_count and gt_count > 0
             if match:
                 correct_count += 1
-
-            html += f'<tr>'
-            html += f'<td style="padding:8px; border:1px solid #E0E0E0;">{cls_name}</td>'
-            html += f'<td style="padding:8px; border:1px solid #E0E0E0;">{gt_count} 个</td>'
-            html += f'<td style="padding:8px; border:1px solid #E0E0E0;">{pred_count} 个</td>'
-            html += f'<td style="padding:8px; border:1px solid #E0E0E0;">'
-            if match:
-                html += '✅ 正确'
-            elif gt_count > 0 and pred_count > 0:
-                html += '⚠️ 数量偏差'
-            elif gt_count == 0:
-                html += '❌ 误检'
-            else:
-                html += '❌ 漏检'
-            html += '</td></tr>'
+            status = '✅ 正确' if match else ('⚠️ 数量偏差' if gt_count > 0 and pred_count > 0 else ('❌ 误检' if gt_count == 0 else '❌ 漏检'))
+            html += f'<tr><td style="padding:10px; border:1px solid #E0E0E0;">{cls_name}</td>'
+            html += f'<td style="padding:10px; border:1px solid #E0E0E0;">{gt_count} 个</td>'
+            html += f'<td style="padding:10px; border:1px solid #E0E0E0;">{pred_count} 个</td>'
+            html += f'<td style="padding:10px; border:1px solid #E0E0E0;">{status}</td></tr>'
 
         html += '</table>'
 
-        # 总结
         accuracy = correct_count / total_classes * 100 if all_classes else 0
         if accuracy == 100:
-            summary = '<p style="margin-top:10px; font-size:15px; color:#2E7D32;">'\
-                      '✅ <b>完全一致</b> — 模型预测与医学标注完全吻合，证明模型检测能力与专业标注水平相当。</p>'
+            html += '<p style="margin-top:12px; font-size:19px; color:#2E7D32;">✅ <b>完全一致</b> — 模型预测与医学标注完全吻合。</p>'
         elif accuracy >= 50:
-            summary = f'<p style="margin-top:10px; font-size:15px; color:#E65100;">'\
-                      f'⚠️ <b>部分一致 ({accuracy:.0f}%)</b> — 模型对部分类别判断正确。</p>'
+            html += f'<p style="margin-top:12px; font-size:19px; color:#E65100;">⚠️ <b>部分一致 ({accuracy:.0f}%)</b></p>'
         else:
-            summary = f'<p style="margin-top:10px; font-size:15px; color:#C62828;">'\
-                      f'❌ <b>偏差较大 ({accuracy:.0f}%)</b> — 建议检查置信度阈值设置。</p>'
+            html += f'<p style="margin-top:12px; font-size:19px; color:#C62828;">❌ <b>偏差较大 ({accuracy:.0f}%)</b></p>'
 
-        html += summary
         self.compare_result.setText(html)
 
     # ============================================================
@@ -724,38 +753,24 @@ class DetectionPage(QWidget):
     # ============================================================
 
     def _export_chart(self, chart_type: str):
-        """
-        导出可视化图表为 PNG 文件。
-
-        Args:
-            chart_type: 'heatmap', 'area', 或 'capability'
-        """
+        """导出可视化图表为 PNG"""
         if not self.current_detections:
             QMessageBox.information(self, "提示", "请先执行检测再导出图表")
             return
-
-        # 文件保存对话框
         default_name = f"{chart_type}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-        file_path, _ = QFileDialog.getSaveFileName(
-            self, "导出图表", default_name, "PNG 图像 (*.png)"
-        )
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出图表", default_name, "PNG 图像 (*.png)")
         if not file_path:
             return
-
-        # 重新生成高清图表并保存
         plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'DejaVu Sans']
         plt.rcParams['axes.unicode_minus'] = False
-
         if chart_type == 'heatmap':
             fig = self._create_heatmap_chart(self.current_detections)
         elif chart_type == 'area':
             fig = self._create_area_chart(self.current_detections)
         else:
             fig = self._create_capability_chart(self.current_detections)
-
         fig.savefig(file_path, dpi=200, bbox_inches='tight')
         plt.close(fig)
-
         QMessageBox.information(self, "导出成功", f"图表已保存到:\n{file_path}")
 
     # ============================================================
@@ -769,19 +784,20 @@ class DetectionPage(QWidget):
                 color: white;
                 border: none;
                 border-radius: 6px;
-                padding: 8px 18px;
-                font-size: 14px;
+                padding: 10px 22px;
+                font-size: 20px;
                 font-family: "Microsoft YaHei";
             }
             #toolButton:hover { background-color: #1565C0; }
+            #toolButton:disabled { background-color: #90CAF9; }
 
             #exportButton {
                 background-color: #7B1FA2;
                 color: white;
                 border: none;
                 border-radius: 6px;
-                padding: 8px 16px;
-                font-size: 13px;
+                padding: 10px 20px;
+                font-size: 18px;
                 font-family: "Microsoft YaHei";
             }
             #exportButton:hover { background-color: #6A1B9A; }
@@ -789,13 +805,28 @@ class DetectionPage(QWidget):
             QGroupBox {
                 border: 1px solid #E0E0E0;
                 border-radius: 8px;
-                margin-top: 12px;
-                padding-top: 18px;
+                margin-top: 14px;
+                padding-top: 20px;
                 background: white;
-                font-size: 14px;
+                font-size: 20px;
+                font-weight: bold;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 padding: 0 8px;
+            }
+
+            QTabWidget::pane {
+                border: 1px solid #E0E0E0;
+                border-radius: 6px;
+                background: white;
+            }
+            QTabBar::tab {
+                padding: 10px 20px;
+                font-size: 18px;
+            }
+            QTabBar::tab:selected {
+                color: #1976D2;
+                border-bottom: 2px solid #1976D2;
             }
         """
