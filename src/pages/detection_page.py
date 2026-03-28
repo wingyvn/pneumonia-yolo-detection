@@ -57,16 +57,17 @@ class DetectionWorker(QThread):
 
     信号:
         progress(int, int, str): 当前进度(已完成数, 总数, 文件名)
-        result_ready(str, list, object): 单张检测完成(图片路径, 检测列表, 标注图numpy数组)
+        result_ready(str, list): 单张检测完成(图片路径, 检测列表)
         all_done: 全部检测完成
     """
     progress = pyqtSignal(int, int, str)      # (当前, 总数, 文件名)
-    result_ready = pyqtSignal(str, list, object)  # (路径, 检测结果, 标注图)
+    result_ready = pyqtSignal(str, list)  # (路径, 检测结果)
     all_done = pyqtSignal()
 
-    def __init__(self, detector, image_paths, conf, iou):
+    def __init__(self, detector, username, image_paths, conf, iou):
         super().__init__()
         self.detector = detector
+        self.username = username
         self.image_paths = image_paths
         self.conf = conf
         self.iou = iou
@@ -78,10 +79,20 @@ class DetectionWorker(QThread):
             try:
                 from PIL import Image
                 pil_image = Image.open(path)
-                detections, annotated = self.detector.detect(pil_image, self.conf, self.iou)
-                self.result_ready.emit(path, detections, annotated)
-            except Exception as e:
-                self.result_ready.emit(path, [], None)
+                detections, _ = self.detector.detect(pil_image, self.conf, self.iou)
+
+                # 在后台线程中写入数据库，避免主线程在批量检测时频繁阻塞。
+                save_detection_record(
+                    username=self.username,
+                    image_name=os.path.basename(path),
+                    image_path=path,
+                    detections=detections,
+                    conf_threshold=self.conf,
+                    iou_threshold=self.iou
+                )
+                self.result_ready.emit(path, detections)
+            except Exception:
+                self.result_ready.emit(path, [])
             self.progress.emit(i + 1, total, os.path.basename(path))
         self.all_done.emit()
 
@@ -104,6 +115,7 @@ class DetectionPage(QWidget):
         # 批量检测结果存储: [{path, detections, annotated}, ...]
         self.batch_results = []
         self.worker = None
+        self.is_batch_mode = False
 
         self._load_model()
         self._init_ui()
@@ -385,8 +397,15 @@ class DetectionPage(QWidget):
             return
 
         # 重置批量结果
+        self.is_batch_mode = len(image_paths) > 1
         self.batch_results = []
         self.result_list.clear()
+        self.result_list.setEnabled(not self.is_batch_mode)
+        self.current_detections = []
+        self.current_image_path = None
+
+        if self.is_batch_mode:
+            self._set_busy_preview()
 
         # 获取阈值
         settings = get_user_settings(self.username)
@@ -403,7 +422,7 @@ class DetectionPage(QWidget):
         self.btn_batch.setEnabled(False)
 
         # 创建并启动工作线程
-        self.worker = DetectionWorker(self.detector, image_paths, conf, iou)
+        self.worker = DetectionWorker(self.detector, self.username, image_paths, conf, iou)
         self.worker.progress.connect(self._on_progress)
         self.worker.result_ready.connect(self._on_single_result)
         self.worker.all_done.connect(self._on_all_done)
@@ -418,17 +437,17 @@ class DetectionPage(QWidget):
         self.progress_bar.setValue(current)
         self.progress_label.setText(f"检测中 {current}/{total} — {filename}")
 
-    def _on_single_result(self, image_path, detections, annotated):
+    def _on_single_result(self, image_path, detections):
         """
         每检测完一张图片时调用:
             - 存入 batch_results
             - 添加到左侧列表
-            - 如果是第一张或当前选中的，自动刷新右侧显示
+            - 单张检测时自动刷新右侧显示
         """
         result = {
             'path': image_path,
             'detections': detections,
-            'annotated': annotated
+            'annotated': None
         }
         self.batch_results.append(result)
 
@@ -439,19 +458,9 @@ class DetectionPage(QWidget):
         item = QListWidgetItem(f"{name}\n   {status}")
         self.result_list.addItem(item)
 
-        # 自动选中最新的一项（实时刷新右侧）
-        self.result_list.setCurrentRow(self.result_list.count() - 1)
-
-        # 保存到数据库
-        settings = get_user_settings(self.username)
-        save_detection_record(
-            username=self.username,
-            image_name=name,
-            image_path=image_path,
-            detections=detections,
-            conf_threshold=settings.get('conf_threshold', 0.25),
-            iou_threshold=settings.get('iou_threshold', 0.45)
-        )
+        # 单张检测时直接展示结果；批量时仅更新左侧列表和进度。
+        if not self.is_batch_mode:
+            self.result_list.setCurrentRow(self.result_list.count() - 1)
 
     def _on_all_done(self):
         """全部检测完成"""
@@ -459,14 +468,20 @@ class DetectionPage(QWidget):
         self.progress_label.setVisible(False)
         self.btn_select.setEnabled(True)
         self.btn_batch.setEnabled(True)
+        self.result_list.setEnabled(True)
         self.detection_completed.emit()
 
         total = len(self.batch_results)
+        if self.is_batch_mode and total > 0 and self.result_list.currentRow() < 0:
+            self.result_list.setCurrentRow(0)
+
         if total > 1:
             QMessageBox.information(
                 self, "批量检测完成",
                 f"共处理 {total} 张图片，点击左侧列表可查看每张结果"
             )
+
+        self.is_batch_mode = False
 
     # ============================================================
     # 列表项点击 — 切换显示
@@ -480,7 +495,6 @@ class DetectionPage(QWidget):
         result = self.batch_results[row]
         image_path = result['path']
         detections = result['detections']
-        annotated = result['annotated']
 
         self.current_image_path = image_path
         self.current_detections = detections
@@ -493,6 +507,11 @@ class DetectionPage(QWidget):
         self.label_original.setStyleSheet("background: #FAFAFA; border-radius: 10px;")
 
         # 更新检测结果图
+        annotated = result.get('annotated')
+        if annotated is None:
+            annotated = self.detector.annotate_image(image_path, detections)
+            result['annotated'] = annotated
+
         if annotated is not None:
             h, w, ch = annotated.shape
             qimg = QImage(annotated.data, w, h, ch * w, QImage.Format_RGB888)
@@ -501,7 +520,9 @@ class DetectionPage(QWidget):
             ))
             self.label_result.setStyleSheet("background: #FAFAFA; border-radius: 10px;")
         else:
+            self.label_result.clear()
             self.label_result.setText("✅ 未检测到异常")
+            self.label_result.setStyleSheet("background: #FAFAFA; border-radius: 10px;")
 
         # 更新详情表格
         self._update_result_table(detections)
@@ -546,6 +567,28 @@ class DetectionPage(QWidget):
             else:
                 bar.setStyleSheet("QProgressBar::chunk { background: #E53935; } QProgressBar { font-size: 15px; }")
             self.result_table.setCellWidget(row, 5, bar)
+
+    def _set_busy_preview(self):
+        """批量检测时冻结右侧详情区域，避免主线程频繁重绘。"""
+        self.label_original.clear()
+        self.label_original.setText("批量检测进行中\n完成后可查看原图")
+        self.label_original.setStyleSheet(
+            "background: #FAFAFA; border: 2px dashed #CCC; border-radius: 10px; "
+            "color: #999; font-size: 20px;"
+        )
+
+        self.label_result.clear()
+        self.label_result.setText("批量检测进行中\n右侧详情已暂停刷新")
+        self.label_result.setStyleSheet(
+            "background: #FAFAFA; border: 2px dashed #CCC; border-radius: 10px; "
+            "color: #999; font-size: 20px;"
+        )
+
+        self.result_table.setRowCount(0)
+        for chart in [self.chart_heatmap, self.chart_area, self.chart_capability]:
+            chart.clear()
+            chart.setText("批量检测中")
+        self.compare_result.setText("批量检测进行中，完成后选择左侧图片查看对照验证。")
 
     def _update_detection_charts(self, detections: list):
         """为当前检测结果生成三张可视化图表"""

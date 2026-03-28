@@ -8,7 +8,7 @@ YOLO 检测器封装模块
 
 import os
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
 
 
@@ -143,6 +143,64 @@ class PneumoniaDetector:
                 })
 
         return detections, annotated_image
+
+    def annotate_image(self, image_path: str, detections: list) -> np.ndarray | None:
+        """
+        基于已保存的检测结果重新绘制标注图，避免在批量检测信号中传输大数组。
+
+        Args:
+            image_path: 原图路径
+            detections: detect() 返回的检测结果列表
+
+        Returns:
+            RGB numpy 数组，失败时返回 None
+        """
+        if not os.path.exists(image_path):
+            return None
+
+        try:
+            image = Image.open(image_path).convert('RGB')
+            draw = ImageDraw.Draw(image)
+            font = self._load_label_font(image.size)
+
+            for det in detections:
+                cls_id = det.get('class_id', -1)
+                color = CLASS_COLORS[cls_id] if 0 <= cls_id < len(CLASS_COLORS) else (150, 150, 150)
+                bbox = det.get('bbox', [])
+                if len(bbox) != 4:
+                    continue
+
+                x1, y1, x2, y2 = bbox
+                label = f"{det.get('class_name', 'unknown')} {det.get('confidence', 0):.2f}"
+
+                draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+
+                if font is not None:
+                    left, top, right, bottom = draw.textbbox((x1, y1), label, font=font)
+                    text_w = right - left
+                    text_h = bottom - top
+                else:
+                    text_w = int(max(48, len(label) * 7))
+                    text_h = 14
+
+                text_y = max(0, y1 - text_h - 6)
+                draw.rectangle([x1, text_y, x1 + text_w + 8, text_y + text_h + 6], fill=color)
+                draw.text((x1 + 4, text_y + 3), label, fill='white', font=font)
+
+            return np.array(image)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _load_label_font(image_size: tuple) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        """优先加载 Windows 常见字体，失败时退回 PIL 默认字体。"""
+        font_size = max(14, int(min(image_size) * 0.025))
+        for font_name in ['msyh.ttc', 'simhei.ttf', 'arial.ttf']:
+            try:
+                return ImageFont.truetype(font_name, font_size)
+            except OSError:
+                continue
+        return ImageFont.load_default()
 
 
 def find_available_models(runs_dir: str = './runs/detect') -> dict:
