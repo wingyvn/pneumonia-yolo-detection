@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QLabel, QFileDialog, QScrollArea, QFrame, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
     QGroupBox, QSizePolicy, QMessageBox, QTabWidget,
-    QListWidget, QListWidgetItem
+    QListWidget, QListWidgetItem, QDialog
 )
 from PyQt5.QtCore import Qt, pyqtSignal, QThread, QSize
 from PyQt5.QtGui import QPixmap, QImage, QFont, QColor, QPainter, QIcon
@@ -101,6 +101,196 @@ class DetectionWorker(QThread):
 
 
 # ============================================================
+# 批量汇总窗口
+# ============================================================
+
+class BatchSummaryDialog(QDialog):
+    """用于展示完整批量汇总信息并导出报告。"""
+
+    def __init__(self, parent, summary_data: dict, status_pixmap: QPixmap, class_pixmap: QPixmap):
+        super().__init__(parent)
+        self.summary_data = summary_data
+        self.status_pixmap = status_pixmap
+        self.class_pixmap = class_pixmap
+        self.setWindowTitle("批量检测汇总报告")
+        self.resize(1200, 820)
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("🧾 当前批次完整汇总")
+        title.setStyleSheet("font-size: 22px; font-weight: bold; color: #1A237E;")
+        layout.addWidget(title)
+
+        self.overview_label = QLabel(self._build_overview_html())
+        self.overview_label.setWordWrap(True)
+        self.overview_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.overview_label.setStyleSheet(
+            "background: white; border: 1px solid #E0E0E0; border-radius: 8px; "
+            "padding: 15px; font-size: 17px; font-family: 'Microsoft YaHei';"
+        )
+        layout.addWidget(self.overview_label)
+
+        charts_layout = QHBoxLayout()
+        charts_layout.setSpacing(12)
+
+        self.status_chart_label = QLabel()
+        self.status_chart_label.setAlignment(Qt.AlignCenter)
+        self.status_chart_label.setMinimumHeight(280)
+        self.status_chart_label.setStyleSheet("background: white; border: 1px solid #E0E0E0; border-radius: 6px;")
+        self.status_chart_label.setPixmap(self.status_pixmap)
+        charts_layout.addWidget(self.status_chart_label)
+
+        self.class_chart_label = QLabel()
+        self.class_chart_label.setAlignment(Qt.AlignCenter)
+        self.class_chart_label.setMinimumHeight(280)
+        self.class_chart_label.setStyleSheet("background: white; border: 1px solid #E0E0E0; border-radius: 6px;")
+        self.class_chart_label.setPixmap(self.class_pixmap)
+        charts_layout.addWidget(self.class_chart_label)
+        layout.addLayout(charts_layout)
+
+        self.risk_table = QTableWidget(0, 5)
+        self.risk_table.setHorizontalHeaderLabels(['图片', '风险等级', '主要结果', '最高置信度', '检出数'])
+        self.risk_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.risk_table.setAlternatingRowColors(True)
+        self.risk_table.setStyleSheet("""
+            QTableWidget { background: white; gridline-color: #E0E0E0; font-size: 15px; }
+            QHeaderView::section { background: #E3F2FD; font-weight: bold; padding: 8px; font-size: 15px; }
+        """)
+        layout.addWidget(self.risk_table)
+        self._fill_risk_table()
+
+        export_layout = QHBoxLayout()
+        export_layout.addStretch()
+
+        btn_export_txt = QPushButton("导出 TXT")
+        btn_export_txt.clicked.connect(lambda: self._export_report('txt'))
+        export_layout.addWidget(btn_export_txt)
+
+        btn_export_json = QPushButton("导出 JSON")
+        btn_export_json.clicked.connect(lambda: self._export_report('json'))
+        export_layout.addWidget(btn_export_json)
+
+        btn_export_csv = QPushButton("导出 CSV")
+        btn_export_csv.clicked.connect(lambda: self._export_report('csv'))
+        export_layout.addWidget(btn_export_csv)
+
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        export_layout.addWidget(btn_close)
+        layout.addLayout(export_layout)
+
+        self.setStyleSheet("""
+            QPushButton {
+                background-color: #1976D2;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 10px 18px;
+                font-size: 14px;
+                font-family: "Microsoft YaHei";
+            }
+            QPushButton:hover { background-color: #1565C0; }
+        """)
+
+    def _build_overview_html(self) -> str:
+        data = self.summary_data
+        return "<br>".join([
+            f"<b>当前批次模式：</b>{data['mode_text']}",
+            f"<b>总图片数：</b>{data['total_images']} 张",
+            f"<b>异常图片：</b>{data['abnormal_images']} 张",
+            f"<b>健康图片：</b>{data['healthy_images']} 张",
+            f"<b>未检出图片：</b>{data['no_detection_images']} 张",
+            f"<b>涉及类别数：</b>{data['involved_class_count']} 类",
+            f"<b>平均置信度：</b>{data['avg_confidence']:.4f}",
+            f"<b>生成时间：</b>{data['generated_at']}",
+        ])
+
+    def _fill_risk_table(self):
+        rows = self.summary_data.get('image_rows', [])
+        self.risk_table.setRowCount(len(rows))
+        for row, item in enumerate(rows):
+            self.risk_table.setItem(row, 0, QTableWidgetItem(item['image_name']))
+            self.risk_table.setItem(row, 1, QTableWidgetItem(item['risk_level']))
+            self.risk_table.setItem(row, 2, QTableWidgetItem(item['major_result']))
+            self.risk_table.setItem(row, 3, QTableWidgetItem(f"{item['risk_score']:.4f}"))
+            self.risk_table.setItem(row, 4, QTableWidgetItem(str(item['num_detections'])))
+
+    def _export_report(self, file_type: str):
+        suffix_map = {'txt': 'TXT 文本 (*.txt)', 'json': 'JSON 文件 (*.json)', 'csv': 'CSV 文件 (*.csv)'}
+        default_name = f"batch_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file_type}"
+        file_path, _ = QFileDialog.getSaveFileName(self, "导出批次报告", default_name, suffix_map[file_type])
+        if not file_path:
+            return
+
+        try:
+            if file_type == 'txt':
+                self._export_txt(file_path)
+            elif file_type == 'json':
+                self._export_json(file_path)
+            else:
+                self._export_csv(file_path)
+            QMessageBox.information(self, "导出成功", f"批次报告已保存到:\n{file_path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", f"导出批次报告时出错:\n{exc}")
+
+    def _export_txt(self, file_path: str):
+        data = self.summary_data
+        lines = [
+            "==============================",
+            "      肺炎检测批次汇总报告",
+            "==============================",
+            f"模式: {data['mode_text']}",
+            f"总图片数: {data['total_images']}",
+            f"异常图片: {data['abnormal_images']}",
+            f"健康图片: {data['healthy_images']}",
+            f"未检出图片: {data['no_detection_images']}",
+            f"涉及类别数: {data['involved_class_count']}",
+            f"平均置信度: {data['avg_confidence']:.4f}",
+            f"生成时间: {data['generated_at']}",
+            "",
+            "[图片级类别统计]",
+        ]
+        for class_name, count in data.get('image_level_class_counts', {}).items():
+            lines.append(f"- {class_name}: {count} 张")
+
+        lines.append("")
+        lines.append("[Top 风险图片]")
+        for item in data.get('top_risk_rows', []):
+            lines.append(
+                f"- {item['image_name']} | 风险={item['risk_level']} | 主要结果={item['major_result']} "
+                f"| 最高置信度={item['risk_score']:.4f} | 检出数={item['num_detections']}"
+            )
+
+        with open(file_path, 'w', encoding='utf-8') as file:
+            file.write("\n".join(lines))
+
+    def _export_json(self, file_path: str):
+        with open(file_path, 'w', encoding='utf-8') as file:
+            json.dump(self.summary_data, file, ensure_ascii=False, indent=2)
+
+    def _export_csv(self, file_path: str):
+        rows = self.summary_data.get('image_rows', [])
+        headers = ['image_name', 'risk_level', 'major_result', 'risk_score', 'num_detections', 'detected_classes']
+        with open(file_path, 'w', encoding='utf-8-sig') as file:
+            file.write(",".join(headers) + "\n")
+            for item in rows:
+                values = [
+                    item['image_name'],
+                    item['risk_level'],
+                    item['major_result'],
+                    f"{item['risk_score']:.4f}",
+                    str(item['num_detections']),
+                    "|".join(item['detected_classes'])
+                ]
+                escaped = ['"' + value.replace('"', '""') + '"' for value in values]
+                file.write(",".join(escaped) + "\n")
+
+
+# ============================================================
 # 检测页面主体
 # ============================================================
 
@@ -120,6 +310,7 @@ class DetectionPage(QWidget):
         self.worker = None
         self.is_batch_mode = False
         self.current_run_settings = get_user_settings(self.username)
+        self.last_summary_data = None
 
         self._load_model()
         self._init_ui()
@@ -134,6 +325,14 @@ class DetectionPage(QWidget):
                 model_path = list(models.values())[0]
         if model_path:
             self.detector.load_model(model_path)
+
+    def refresh_runtime_settings(self):
+        """设置页保存后同步刷新检测页的模式标签、模型状态和运行参数缓存。"""
+        self.current_run_settings = get_user_settings(self.username)
+        self._apply_mode_label(self.current_run_settings)
+        self._load_model()
+        model_status = "✅ 模型已加载" if self.detector.is_loaded() else "❌ 模型未加载"
+        self.model_label.setText(model_status)
 
     def _init_ui(self):
         """构建检测页面布局"""
@@ -152,6 +351,12 @@ class DetectionPage(QWidget):
         self.btn_batch.setObjectName("toolButton")
         self.btn_batch.clicked.connect(self._batch_detect)
         toolbar.addWidget(self.btn_batch)
+
+        self.btn_summary = QPushButton("🧾 批次汇总")
+        self.btn_summary.setObjectName("toolButton")
+        self.btn_summary.clicked.connect(self._open_batch_summary)
+        self.btn_summary.setEnabled(False)
+        toolbar.addWidget(self.btn_summary)
 
         toolbar.addStretch()
 
@@ -357,45 +562,6 @@ class DetectionPage(QWidget):
         compare_layout.addWidget(self.compare_result)
         self.bottom_tabs.addTab(compare_widget, "✅ 对照验证")
 
-        # Tab 4: 批量汇总
-        summary_widget = QWidget()
-        summary_layout = QVBoxLayout(summary_widget)
-
-        self.summary_overview = QLabel("请先执行检测")
-        self.summary_overview.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.summary_overview.setWordWrap(True)
-        self.summary_overview.setMinimumHeight(120)
-        self.summary_overview.setStyleSheet(
-            "background: white; border: 1px solid #E0E0E0; border-radius: 8px; "
-            "padding: 15px; font-size: 18px; font-family: 'Microsoft YaHei';"
-        )
-        summary_layout.addWidget(self.summary_overview)
-
-        summary_chart_layout = QHBoxLayout()
-        self.summary_status_chart = QLabel("待检测")
-        self.summary_status_chart.setAlignment(Qt.AlignCenter)
-        self.summary_status_chart.setMinimumHeight(220)
-        self.summary_status_chart.setStyleSheet("background: white; border: 1px solid #E0E0E0; border-radius: 6px;")
-        summary_chart_layout.addWidget(self.summary_status_chart)
-
-        self.summary_class_chart = QLabel("待检测")
-        self.summary_class_chart.setAlignment(Qt.AlignCenter)
-        self.summary_class_chart.setMinimumHeight(220)
-        self.summary_class_chart.setStyleSheet("background: white; border: 1px solid #E0E0E0; border-radius: 6px;")
-        summary_chart_layout.addWidget(self.summary_class_chart)
-        summary_layout.addLayout(summary_chart_layout)
-
-        self.summary_risk_table = QTableWidget(0, 4)
-        self.summary_risk_table.setHorizontalHeaderLabels(['图片', '风险等级', '主要结果', '最高置信度'])
-        self.summary_risk_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.summary_risk_table.setAlternatingRowColors(True)
-        self.summary_risk_table.setStyleSheet("""
-            QTableWidget { background: white; gridline-color: #E0E0E0; font-size: 16px; }
-            QHeaderView::section { background: #E8F5E9; font-weight: bold; padding: 8px; font-size: 16px; }
-        """)
-        summary_layout.addWidget(self.summary_risk_table)
-        self.bottom_tabs.addTab(summary_widget, "🧾 批量汇总")
-
         right_splitter.addWidget(self.bottom_tabs)
         right_splitter.setSizes([400, 300])
 
@@ -527,12 +693,11 @@ class DetectionPage(QWidget):
         self._update_batch_summary()
         if self.is_batch_mode and total > 0 and self.result_list.currentRow() < 0:
             self.result_list.setCurrentRow(0)
-            self.bottom_tabs.setCurrentIndex(3)
 
         if total > 1:
             QMessageBox.information(
                 self, "批量检测完成",
-                f"共处理 {total} 张图片，点击左侧列表可查看每张结果"
+                f"共处理 {total} 张图片。\n点击左侧列表可查看单张结果，点击“批次汇总”可查看完整报告。"
             )
 
         self.is_batch_mode = False
@@ -643,12 +808,6 @@ class DetectionPage(QWidget):
             chart.clear()
             chart.setText("批量检测中")
         self.compare_result.setText("批量检测进行中，完成后选择左侧图片查看对照验证。")
-        self.summary_overview.setText("批量检测进行中，系统会在完成后自动生成当前批次的检测汇总。")
-        self.summary_status_chart.clear()
-        self.summary_status_chart.setText("批量检测中")
-        self.summary_class_chart.clear()
-        self.summary_class_chart.setText("批量检测中")
-        self.summary_risk_table.setRowCount(0)
 
     def _apply_mode_label(self, settings: dict):
         """更新顶部当前模式提示。"""
@@ -671,12 +830,8 @@ class DetectionPage(QWidget):
 
     def _reset_batch_summary(self):
         """重置批量汇总区域。"""
-        self.summary_overview.setText("请先执行检测")
-        self.summary_status_chart.clear()
-        self.summary_status_chart.setText("待检测")
-        self.summary_class_chart.clear()
-        self.summary_class_chart.setText("待检测")
-        self.summary_risk_table.setRowCount(0)
+        self.last_summary_data = None
+        self.btn_summary.setEnabled(False)
 
     def _update_batch_summary(self):
         """根据当前批次结果生成汇总信息。"""
@@ -714,43 +869,30 @@ class DetectionPage(QWidget):
                 'image_name': os.path.basename(result['path']),
                 'risk_level': risk_level,
                 'major_result': major_result,
-                'risk_score': risk_score
+                'risk_score': risk_score,
+                'num_detections': len(detections),
+                'detected_classes': sorted(unique_classes)
             })
 
         avg_conf = float(np.mean(avg_conf_values)) if avg_conf_values else 0.0
         mode_text = self._mode_text(self.current_run_settings)
 
-        summary_lines = [
-            f"<b>当前批次模式：</b>{mode_text}",
-            f"<b>总图片数：</b>{total} 张",
-            f"<b>异常图片：</b>{abnormal_images} 张",
-            f"<b>健康图片：</b>{healthy_images} 张",
-            f"<b>未检出图片：</b>{no_detection_images} 张",
-            f"<b>涉及类别数：</b>{len(image_level_class_counter)} 类",
-            f"<b>平均置信度：</b>{avg_conf:.4f}",
-        ]
-        self.summary_overview.setText("<br>".join(summary_lines))
-
-        status_fig = self._create_batch_status_chart(abnormal_images, healthy_images, no_detection_images)
-        self.summary_status_chart.setPixmap(_fig_to_qpixmap(status_fig).scaled(
-            self.summary_status_chart.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ))
-        plt.close(status_fig)
-
-        class_fig = self._create_batch_class_chart(image_level_class_counter)
-        self.summary_class_chart.setPixmap(_fig_to_qpixmap(class_fig).scaled(
-            self.summary_class_chart.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-        ))
-        plt.close(class_fig)
-
         risk_rows.sort(key=lambda item: item['risk_score'], reverse=True)
-        top_rows = risk_rows[:5]
-        self.summary_risk_table.setRowCount(len(top_rows))
-        for row, item in enumerate(top_rows):
-            self.summary_risk_table.setItem(row, 0, QTableWidgetItem(item['image_name']))
-            self.summary_risk_table.setItem(row, 1, QTableWidgetItem(item['risk_level']))
-            self.summary_risk_table.setItem(row, 2, QTableWidgetItem(item['major_result']))
-            self.summary_risk_table.setItem(row, 3, QTableWidgetItem(f"{item['risk_score']:.4f}"))
+        self.last_summary_data = {
+            'mode_text': mode_text,
+            'total_images': total,
+            'abnormal_images': abnormal_images,
+            'healthy_images': healthy_images,
+            'no_detection_images': no_detection_images,
+            'involved_class_count': len(image_level_class_counter),
+            'avg_confidence': avg_conf,
+            'image_level_class_counts': dict(image_level_class_counter),
+            'total_detection_counts': dict(total_detection_counter),
+            'top_risk_rows': risk_rows[:5],
+            'image_rows': risk_rows,
+            'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        }
+        self.btn_summary.setEnabled(True)
 
     @staticmethod
     def _evaluate_result_risk(detections: list) -> tuple:
@@ -767,6 +909,27 @@ class DetectionPage(QWidget):
         if class_name == 'healthy':
             return '健康', major_result, risk_score
         return '异常', major_result, risk_score
+
+    def _open_batch_summary(self):
+        """打开完整批量汇总窗口。"""
+        if not self.last_summary_data:
+            QMessageBox.information(self, "提示", "请先执行批量检测，再查看汇总报告")
+            return
+
+        status_fig = self._create_batch_status_chart(
+            self.last_summary_data['abnormal_images'],
+            self.last_summary_data['healthy_images'],
+            self.last_summary_data['no_detection_images']
+        )
+        status_pixmap = _fig_to_qpixmap(status_fig)
+        plt.close(status_fig)
+
+        class_fig = self._create_batch_class_chart(Counter(self.last_summary_data['image_level_class_counts']))
+        class_pixmap = _fig_to_qpixmap(class_fig)
+        plt.close(class_fig)
+
+        dialog = BatchSummaryDialog(self, self.last_summary_data, status_pixmap, class_pixmap)
+        dialog.exec_()
 
     def _update_detection_charts(self, detections: list):
         """为当前检测结果生成三张可视化图表"""

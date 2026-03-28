@@ -127,6 +127,8 @@ class MainWindow(QMainWindow):
 
         # 当设置变更时刷新主窗口背景
         self.settings_page.settings_changed.connect(self._apply_background)
+        # 同步刷新检测页运行时设置（模式标签、模型状态、参数缓存）
+        self.settings_page.settings_changed.connect(self.detection_page.refresh_runtime_settings)
         # 当检测完成时通知可视化页面刷新数据
         self.detection_page.detection_completed.connect(
             self.visualization_page.refresh_data
@@ -160,6 +162,8 @@ class MainWindow(QMainWindow):
         # 切换到可视化页面时自动刷新数据
         if index == 1:
             self.visualization_page.refresh_data()
+        elif index == 0:
+            self.detection_page.refresh_runtime_settings()
 
     def _show_user_menu(self):
         """
