@@ -21,6 +21,16 @@ from datetime import datetime
 DB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '..', 'data')
 DB_PATH = os.path.join(DB_DIR, 'app.db')
 
+DEFAULT_USER_SETTINGS = {
+    'conf_threshold': 0.25,
+    'iou_threshold': 0.45,
+    'model_path': '',
+    'background_image': '',
+    'inference_mode': 'standard',
+    'per_class_thresholds': {},
+    'healthy_margin': 0.15
+}
+
 
 def _get_connection():
     """
@@ -31,6 +41,16 @@ def _get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row  # 使查询结果可以按列名访问
     return conn
+
+
+def _ensure_column(conn, table_name: str, column_name: str, definition: str):
+    """在旧数据库上补齐新增字段，避免要求用户手动删库重建。"""
+    columns = {
+        row['name']
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}")
 
 
 def init_database():
@@ -62,6 +82,7 @@ def init_database():
             num_detections INTEGER DEFAULT 0,    -- 检出目标数量
             conf_threshold REAL,                 -- 使用的置信度阈值
             iou_threshold REAL,                  -- 使用的 IoU 阈值
+            inference_mode TEXT DEFAULT 'standard', -- 标准模式 / 应用模式
             created_at TEXT DEFAULT (datetime('now', 'localtime'))
         )
     ''')
@@ -75,11 +96,19 @@ def init_database():
             iou_threshold REAL DEFAULT 0.45,     -- IoU 阈值
             model_path TEXT DEFAULT '',          -- 当前选用的模型路径
             background_image TEXT DEFAULT '',    -- 背景图片路径
+            inference_mode TEXT DEFAULT 'standard', -- 推理模式
+            per_class_thresholds_json TEXT DEFAULT '', -- 分类别阈值
+            healthy_margin REAL DEFAULT 0.15,    -- healthy 覆盖异常类所需的最小领先幅度
             remember_password INTEGER DEFAULT 0, -- 是否记住密码 (0/1)
             saved_username TEXT DEFAULT '',      -- 记住的用户名
             saved_password TEXT DEFAULT ''       -- 记住的密码（加密存储）
         )
     ''')
+
+    _ensure_column(conn, 'detection_records', 'inference_mode', "TEXT DEFAULT 'standard'")
+    _ensure_column(conn, 'settings', 'inference_mode', "TEXT DEFAULT 'standard'")
+    _ensure_column(conn, 'settings', 'per_class_thresholds_json', "TEXT DEFAULT ''")
+    _ensure_column(conn, 'settings', 'healthy_margin', "REAL DEFAULT 0.15")
 
     conn.commit()
     conn.close()
@@ -216,7 +245,8 @@ def clear_remembered_login():
 # ============================================================
 
 def save_detection_record(username: str, image_name: str, image_path: str,
-                          detections: list, conf_threshold: float, iou_threshold: float):
+                          detections: list, conf_threshold: float, iou_threshold: float,
+                          inference_mode: str = 'standard'):
     """
     保存一条检测记录。
 
@@ -227,17 +257,19 @@ def save_detection_record(username: str, image_name: str, image_path: str,
         detections: 检测结果列表（字典列表）
         conf_threshold: 使用的置信度阈值
         iou_threshold: 使用的 IoU 阈值
+        inference_mode: 当前采用的推理模式
     """
     conn = _get_connection()
     conn.execute('''
         INSERT INTO detection_records
-        (username, image_name, image_path, detections_json, num_detections, conf_threshold, iou_threshold)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        (username, image_name, image_path, detections_json, num_detections, conf_threshold, iou_threshold, inference_mode)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         username, image_name, image_path,
         json.dumps(detections, ensure_ascii=False),
         len(detections),
         conf_threshold, iou_threshold
+        , inference_mode
     ))
     conn.commit()
     conn.close()
@@ -296,14 +328,16 @@ def get_user_settings(username: str) -> dict:
     conn.close()
 
     if row:
-        return dict(row)
-    else:
-        return {
-            'conf_threshold': 0.25,
-            'iou_threshold': 0.45,
-            'model_path': '',
-            'background_image': ''
-        }
+        settings = dict(row)
+        thresholds_json = settings.get('per_class_thresholds_json') or ''
+        try:
+            settings['per_class_thresholds'] = json.loads(thresholds_json) if thresholds_json else {}
+        except json.JSONDecodeError:
+            settings['per_class_thresholds'] = {}
+        for key, value in DEFAULT_USER_SETTINGS.items():
+            settings.setdefault(key, value)
+        return settings
+    return DEFAULT_USER_SETTINGS.copy()
 
 
 def save_user_settings(username: str, **kwargs):
@@ -320,10 +354,16 @@ def save_user_settings(username: str, **kwargs):
     conn.commit()
 
     # 动态构建 UPDATE 语句
-    allowed_fields = {'conf_threshold', 'iou_threshold', 'model_path', 'background_image'}
+    allowed_fields = {
+        'conf_threshold', 'iou_threshold', 'model_path', 'background_image',
+        'inference_mode', 'per_class_thresholds_json', 'healthy_margin'
+    }
     updates = []
     values = []
     for key, value in kwargs.items():
+        if key == 'per_class_thresholds':
+            key = 'per_class_thresholds_json'
+            value = json.dumps(value, ensure_ascii=False)
         if key in allowed_fields:
             updates.append(f"{key} = ?")
             values.append(value)

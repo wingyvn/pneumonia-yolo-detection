@@ -14,13 +14,22 @@ import os
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QLabel, QSlider, QFileDialog, QGroupBox,
-    QComboBox, QScrollArea, QMessageBox, QFrame
+    QComboBox, QScrollArea, QMessageBox, QFrame,
+    QDoubleSpinBox, QFormLayout
 )
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtGui import QPixmap
 
 from utils.db_manager import get_user_settings, save_user_settings
-from utils.detector import find_available_models
+from utils.detector import find_available_models, CLASS_NAMES, CLASS_NAMES_CN
+
+DEFAULT_APPLICATION_THRESHOLDS = {
+    'Pneumonia Bacteria': 0.25,
+    'Pneumonia Virus': 0.25,
+    'Sick': 0.35,
+    'healthy': 0.60,
+    'tuberculosis': 0.20
+}
 
 
 class SettingsPage(QWidget):
@@ -112,7 +121,61 @@ class SettingsPage(QWidget):
 
         layout.addWidget(param_group)
 
-        # ========== 2. 模型管理 ==========
+        # ========== 2. 应用判读模式 ==========
+        mode_group = QGroupBox("🩺 应用判读模式")
+        mode_group.setStyleSheet(self._group_style())
+        mode_layout = QVBoxLayout(mode_group)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("推理模式:"))
+        self.inference_mode_combo = QComboBox()
+        self.inference_mode_combo.addItem("标准模式（与原始 YOLO 输出一致）", "standard")
+        self.inference_mode_combo.addItem("应用模式（分类别阈值 + 规则后处理）", "application")
+        self.inference_mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        mode_row.addWidget(self.inference_mode_combo)
+        mode_row.addStretch()
+        mode_layout.addLayout(mode_row)
+
+        mode_desc = QLabel(
+            "标准模式用于论文复现实验；应用模式用于系统部署判读，支持具体病种优先、healthy 严格判定。"
+        )
+        mode_desc.setWordWrap(True)
+        mode_desc.setStyleSheet("color: #666; font-size: 11px;")
+        mode_layout.addWidget(mode_desc)
+
+        margin_row = QHBoxLayout()
+        margin_row.addWidget(QLabel("healthy 覆盖 margin:"))
+        self.healthy_margin_spin = QDoubleSpinBox()
+        self.healthy_margin_spin.setRange(0.00, 0.50)
+        self.healthy_margin_spin.setSingleStep(0.01)
+        self.healthy_margin_spin.setDecimals(2)
+        self.healthy_margin_spin.setValue(0.15)
+        self.healthy_margin_spin.setSuffix(" 分")
+        margin_row.addWidget(self.healthy_margin_spin)
+        margin_row.addStretch()
+        mode_layout.addLayout(margin_row)
+
+        threshold_desc = QLabel("应用模式下可为每个类别设置独立阈值，建议后续依据验证集 PR 曲线再回填。")
+        threshold_desc.setWordWrap(True)
+        threshold_desc.setStyleSheet("color: #888; font-size: 11px;")
+        mode_layout.addWidget(threshold_desc)
+
+        self.threshold_form = QFormLayout()
+        self.threshold_form.setLabelAlignment(Qt.AlignRight)
+        self.class_threshold_spins = {}
+        for class_name, class_name_cn in zip(CLASS_NAMES, CLASS_NAMES_CN):
+            spin = QDoubleSpinBox()
+            spin.setRange(0.05, 0.95)
+            spin.setSingleStep(0.01)
+            spin.setDecimals(2)
+            spin.setValue(DEFAULT_APPLICATION_THRESHOLDS.get(class_name, 0.25))
+            self.class_threshold_spins[class_name] = spin
+            self.threshold_form.addRow(f"{class_name_cn} ({class_name})", spin)
+        mode_layout.addLayout(self.threshold_form)
+
+        layout.addWidget(mode_group)
+
+        # ========== 3. 模型管理 ==========
         model_group = QGroupBox("🧠 模型管理")
         model_group.setStyleSheet(self._group_style())
         model_layout = QVBoxLayout(model_group)
@@ -138,7 +201,7 @@ class SettingsPage(QWidget):
 
         layout.addWidget(model_group)
 
-        # ========== 3. 界面设置 ==========
+        # ========== 4. 界面设置 ==========
         ui_group = QGroupBox("🎨 界面设置")
         ui_group.setStyleSheet(self._group_style())
         ui_layout = QVBoxLayout(ui_group)
@@ -205,10 +268,22 @@ class SettingsPage(QWidget):
         iou = settings.get('iou_threshold', 0.45)
         model_path = settings.get('model_path', '')
         bg_image = settings.get('background_image', '')
+        inference_mode = settings.get('inference_mode', 'standard')
+        healthy_margin = settings.get('healthy_margin', 0.15)
+        per_class_thresholds = settings.get('per_class_thresholds', {})
 
         # 应用到控件
         self.conf_slider.setValue(int(conf * 100))
         self.iou_slider.setValue(int(iou * 100))
+        self.healthy_margin_spin.setValue(float(healthy_margin))
+
+        mode_index = self.inference_mode_combo.findData(inference_mode)
+        if mode_index >= 0:
+            self.inference_mode_combo.setCurrentIndex(mode_index)
+        self._on_mode_changed()
+
+        for class_name, spin in self.class_threshold_spins.items():
+            spin.setValue(float(per_class_thresholds.get(class_name, DEFAULT_APPLICATION_THRESHOLDS.get(class_name, conf))))
 
         # 模型路径
         if model_path:
@@ -231,13 +306,21 @@ class SettingsPage(QWidget):
         iou = self.iou_slider.value() / 100.0
         model_path = self.model_combo.currentData() or ''
         bg_image = self.bg_path_label.property('full_path') or ''
+        inference_mode = self.inference_mode_combo.currentData() or 'standard'
+        per_class_thresholds = {
+            class_name: spin.value()
+            for class_name, spin in self.class_threshold_spins.items()
+        }
 
         save_user_settings(
             self.username,
             conf_threshold=conf,
             iou_threshold=iou,
             model_path=model_path,
-            background_image=bg_image
+            background_image=bg_image,
+            inference_mode=inference_mode,
+            per_class_thresholds=per_class_thresholds,
+            healthy_margin=self.healthy_margin_spin.value()
         )
 
         # 发射信号通知主窗口
@@ -256,6 +339,13 @@ class SettingsPage(QWidget):
     def _on_iou_changed(self, value):
         """IoU 滑块值变化时更新显示"""
         self.iou_value_label.setText(f"{value / 100:.2f}")
+
+    def _on_mode_changed(self):
+        """切换推理模式时更新应用模式参数区的可编辑状态。"""
+        is_application = (self.inference_mode_combo.currentData() == 'application')
+        self.healthy_margin_spin.setEnabled(is_application)
+        for spin in self.class_threshold_spins.values():
+            spin.setEnabled(is_application)
 
     def _refresh_model_list(self):
         """刷新可用模型列表"""

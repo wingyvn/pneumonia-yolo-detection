@@ -27,6 +27,9 @@ CLASS_COLORS = [
     (142, 36, 170),   # 紫 — 肺结核
 ]
 
+SPECIFIC_DISEASE_CLASSES = {'Pneumonia Bacteria', 'Pneumonia Virus', 'tuberculosis'}
+ABNORMAL_CLASSES = SPECIFIC_DISEASE_CLASSES | {'Sick'}
+
 
 class PneumoniaDetector:
     """
@@ -201,6 +204,74 @@ class PneumoniaDetector:
             except OSError:
                 continue
         return ImageFont.load_default()
+
+    def apply_inference_policy(self, detections: list, settings: dict) -> list:
+        """
+        根据当前设置对检测结果做部署侧后处理。
+
+        standard:
+            直接返回模型原始结果。
+        application:
+            1. 先按类别阈值过滤
+            2. 若出现具体病种，则移除 Sick
+            3. healthy 只有在满足更严格条件时才覆盖异常类
+        """
+        if settings.get('inference_mode', 'standard') != 'application':
+            return detections
+
+        global_conf = settings.get('conf_threshold', 0.25)
+        class_thresholds = settings.get('per_class_thresholds') or {}
+        healthy_margin = settings.get('healthy_margin', 0.15)
+
+        filtered = []
+        for det in detections:
+            class_name = det.get('class_name', '')
+            threshold = class_thresholds.get(class_name, global_conf)
+            if det.get('confidence', 0.0) >= threshold:
+                filtered.append(det)
+
+        if not filtered:
+            return []
+
+        has_specific_disease = any(
+            det.get('class_name') in SPECIFIC_DISEASE_CLASSES
+            for det in filtered
+        )
+        if has_specific_disease:
+            filtered = [
+                det for det in filtered
+                if det.get('class_name') != 'Sick'
+            ]
+
+        healthy_candidates = [
+            det for det in filtered
+            if det.get('class_name') == 'healthy'
+        ]
+        abnormal_candidates = [
+            det for det in filtered
+            if det.get('class_name') in ABNORMAL_CLASSES
+        ]
+
+        if healthy_candidates:
+            best_healthy = max(healthy_candidates, key=lambda item: item.get('confidence', 0.0))
+            healthy_threshold = class_thresholds.get('healthy', global_conf)
+
+            if abnormal_candidates:
+                max_abnormal_conf = max(det.get('confidence', 0.0) for det in abnormal_candidates)
+                if (
+                    best_healthy.get('confidence', 0.0) >= healthy_threshold
+                    and best_healthy.get('confidence', 0.0) >= max_abnormal_conf + healthy_margin
+                ):
+                    return [best_healthy]
+
+                filtered = [
+                    det for det in filtered
+                    if det.get('class_name') != 'healthy'
+                ]
+            else:
+                return [best_healthy]
+
+        return filtered
 
 
 def find_available_models(runs_dir: str = './runs/detect') -> dict:
