@@ -29,6 +29,13 @@ CLASS_COLORS = [
 
 SPECIFIC_DISEASE_CLASSES = {'Pneumonia Bacteria', 'Pneumonia Virus', 'tuberculosis'}
 ABNORMAL_CLASSES = SPECIFIC_DISEASE_CLASSES | {'Sick'}
+CLASS_PRIORITY = {
+    'tuberculosis': 5,
+    'Pneumonia Bacteria': 4,
+    'Pneumonia Virus': 4,
+    'Sick': 2,
+    'healthy': 1,
+}
 
 
 class PneumoniaDetector:
@@ -215,6 +222,7 @@ class PneumoniaDetector:
             1. 先按类别阈值过滤
             2. 若出现具体病种，则移除 Sick
             3. healthy 只有在满足更严格条件时才覆盖异常类
+            4. 结合单标签数据集假设，收敛为单一主结论
         """
         if settings.get('inference_mode', 'standard') != 'application':
             return detections
@@ -232,6 +240,9 @@ class PneumoniaDetector:
 
         if not filtered:
             return []
+
+        # 先做同类收敛，避免一个类别的多个框干扰最终主结论。
+        filtered = self._collapse_same_class(filtered)
 
         has_specific_disease = any(
             det.get('class_name') in SPECIFIC_DISEASE_CLASSES
@@ -271,7 +282,41 @@ class PneumoniaDetector:
             else:
                 return [best_healthy]
 
-        return filtered
+        if not filtered:
+            return []
+
+        # 胸片数据集按图片通常只对应一个主类别，应用模式收敛为单一结论。
+        return [self._pick_primary_detection(filtered)]
+
+    @staticmethod
+    def _collapse_same_class(detections: list) -> list:
+        """同一类别只保留最高置信度的结果。"""
+        best_by_class = {}
+        for det in detections:
+            class_name = det.get('class_name', '')
+            current_best = best_by_class.get(class_name)
+            if current_best is None or det.get('confidence', 0.0) > current_best.get('confidence', 0.0):
+                best_by_class[class_name] = det
+        return list(best_by_class.values())
+
+    @staticmethod
+    def _pick_primary_detection(detections: list) -> dict:
+        """
+        在应用模式下从剩余候选里选出单一主结论。
+
+        规则:
+            1. 先比较类别优先级，保证高风险病种更敏感
+            2. 再比较置信度
+            3. 最后比较面积占比，尽量保留更稳定的候选
+        """
+        return max(
+            detections,
+            key=lambda det: (
+                CLASS_PRIORITY.get(det.get('class_name', ''), 0),
+                det.get('confidence', 0.0),
+                det.get('area_ratio', 0.0),
+            )
+        )
 
 
 def find_available_models(runs_dir: str = './runs/detect') -> dict:
