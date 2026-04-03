@@ -5,6 +5,7 @@ Faster R-CNN 对比实验训练脚本
 用途:
     - 复用当前项目的 YOLO 标注数据
     - 训练 torchvision Faster R-CNN 基线
+    - 每轮在验证集上评估 mAP@0.5 / mAP@0.5:0.95
     - 输出到 experiments/faster_rcnn/outputs，不影响现有 YOLOv8
 
 使用示例:
@@ -14,156 +15,128 @@ Faster R-CNN 对比实验训练脚本
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 
 import torch
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
-from torchvision.models.detection import fasterrcnn_resnet50_fpn
-from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.transforms import functional as F
 
-
-WORKSPACE = Path(__file__).resolve().parents[2]
-DATA_ROOT = WORKSPACE
-OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
-CLASS_NAMES = ['Pneumonia Bacteria', 'Pneumonia Virus', 'Sick', 'healthy', 'tuberculosis']
-NUM_CLASSES = len(CLASS_NAMES) + 1  # background + 5 classes
-
-
-class YoloDetectionDataset(Dataset):
-    """读取现有 YOLO txt 标签并转换为 Faster R-CNN 训练格式。"""
-
-    def __init__(self, split: str):
-        self.images_dir = DATA_ROOT / "images" / split
-        self.labels_dir = DATA_ROOT / "labels" / split
-        self.samples = []
-
-        if not self.images_dir.exists():
-            raise FileNotFoundError(f"找不到图像目录: {self.images_dir}")
-
-        for image_path in sorted(self.images_dir.iterdir()):
-            if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp"}:
-                continue
-            label_path = self.labels_dir / f"{image_path.stem}.txt"
-            self.samples.append((image_path, label_path))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, index):
-        image_path, label_path = self.samples[index]
-        image = Image.open(image_path).convert("RGB")
-        width, height = image.size
-
-        boxes = []
-        labels = []
-        if label_path.exists():
-            with label_path.open("r", encoding="utf-8") as file:
-                for line in file:
-                    parts = line.strip().split()
-                    if len(parts) != 5:
-                        continue
-                    class_id = int(parts[0])
-                    cx, cy, bw, bh = map(float, parts[1:])
-
-                    x1 = (cx - bw / 2) * width
-                    y1 = (cy - bh / 2) * height
-                    x2 = (cx + bw / 2) * width
-                    y2 = (cy + bh / 2) * height
-
-                    boxes.append([x1, y1, x2, y2])
-                    labels.append(class_id + 1)  # 0 号保留给 background
-
-        target = {
-            "boxes": torch.as_tensor(boxes, dtype=torch.float32),
-            "labels": torch.as_tensor(labels, dtype=torch.int64),
-            "image_id": torch.tensor([index]),
-        }
-
-        if len(boxes) == 0:
-            target["boxes"] = torch.zeros((0, 4), dtype=torch.float32)
-            target["labels"] = torch.zeros((0,), dtype=torch.int64)
-
-        return F.to_tensor(image), target
-
-
-def collate_fn(batch):
-    return tuple(zip(*batch))
-
-
-def build_model(num_classes: int):
-    model = fasterrcnn_resnet50_fpn(weights="DEFAULT")
-    in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
-    return model
-
-
-def train_one_epoch(model, data_loader, optimizer, device):
-    model.train()
-    total_loss = 0.0
-
-    for images, targets in data_loader:
-        images = [image.to(device) for image in images]
-        targets = [{key: value.to(device) for key, value in target.items()} for target in targets]
-
-        loss_dict = model(images, targets)
-        losses = sum(loss for loss in loss_dict.values())
-
-        optimizer.zero_grad()
-        losses.backward()
-        optimizer.step()
-
-        total_loss += losses.item()
-
-    return total_loss / max(len(data_loader), 1)
+from ..experiment_defaults import FAIR_TRAINING_DEFAULTS
+from .common import (
+    CLASS_NAMES,
+    DEFAULT_OUTPUT_ROOT,
+    build_model,
+    create_dataloader,#
+    evaluate_model,
+    save_json,
+    train_one_epoch,
+)
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train Faster R-CNN baseline")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=FAIR_TRAINING_DEFAULTS["epochs"])
+    parser.add_argument("--batch-size", type=int, default=4, help="单步微批大小；默认结合梯度累积实现等效 batch=16")
+    parser.add_argument("--effective-batch", type=int, default=FAIR_TRAINING_DEFAULTS["batch"])
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--train-split", type=str, default="train")
+    parser.add_argument("--val-split", type=str, default="val")
+    parser.add_argument("--score-threshold", type=float, default=0.05)
+    parser.add_argument("--imgsz", type=int, default=FAIR_TRAINING_DEFAULTS["imgsz"])
+    parser.add_argument("--workers", type=int, default=FAIR_TRAINING_DEFAULTS["workers"])
+    parser.add_argument("--device", type=str, default=FAIR_TRAINING_DEFAULTS["device"])
+    parser.add_argument("--patience", type=int, default=FAIR_TRAINING_DEFAULTS["patience"])
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
-    (OUTPUT_ROOT / "checkpoints").mkdir(exist_ok=True)
+    output_root = DEFAULT_OUTPUT_ROOT
+    checkpoints_dir = output_root / "checkpoints"
+    reports_dir = output_root / "reports"
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dataset = YoloDetectionDataset(args.split)
-    data_loader = DataLoader(
-        dataset,
+    use_cuda = torch.cuda.is_available() and args.device not in {"cpu", "-1"}
+    device = torch.device(f"cuda:{args.device}" if use_cuda else "cpu")
+    _, train_loader = create_dataloader(
+        args.train_split,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn,
+        imgsz=args.imgsz,
+        num_workers=args.workers,
+    )
+    _, val_loader = create_dataloader(
+        args.val_split,
+        batch_size=1,
+        shuffle=False,
+        imgsz=args.imgsz,
+        num_workers=args.workers,
     )
 
-    model = build_model(NUM_CLASSES).to(device)
+    model = build_model().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    accum_steps = max(1, args.effective_batch // max(1, args.batch_size))
+
+    history = []
+    best_map50 = -1.0
+    best_epoch = 0
+    epochs_without_improvement = 0
+    best_checkpoint_path = checkpoints_dir / "best_map50.pth"
 
     for epoch in range(args.epochs):
-        avg_loss = train_one_epoch(model, data_loader, optimizer, device)
-        print(f"Epoch {epoch + 1}/{args.epochs} - loss: {avg_loss:.4f}")
+        avg_loss = train_one_epoch(model, train_loader, optimizer, device, accum_steps=accum_steps)
+        metrics = evaluate_model(model, val_loader, device, score_threshold=args.score_threshold)
 
-        checkpoint_path = OUTPUT_ROOT / "checkpoints" / f"epoch_{epoch + 1:03d}.pth"
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "avg_loss": avg_loss,
-                "class_names": CLASS_NAMES,
-            },
-            checkpoint_path,
+        record = {
+            "epoch": epoch + 1,
+            "avg_loss": avg_loss,
+            "mAP50": metrics["mAP50"],
+            "mAP50_95": metrics["mAP50_95"],
+            "per_class_AP50": metrics["per_class_AP50"],
+        }
+        history.append(record)
+
+        print(
+            f"Epoch {epoch + 1}/{args.epochs} | "
+            f"loss={avg_loss:.4f} | mAP50={metrics['mAP50']:.4f} | mAP50_95={metrics['mAP50_95']:.4f}"
         )
 
-    print(f"训练完成，权重保存在: {OUTPUT_ROOT / 'checkpoints'}")
+        checkpoint_payload = {
+            "epoch": epoch + 1,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "history": history,
+            "class_names": CLASS_NAMES,
+            "train_args": vars(args),
+        }
+
+        latest_checkpoint = checkpoints_dir / f"epoch_{epoch + 1:03d}.pth"
+        torch.save(checkpoint_payload, latest_checkpoint)
+
+        if metrics["mAP50"] > best_map50:
+            best_map50 = metrics["mAP50"]
+            best_epoch = epoch + 1
+            epochs_without_improvement = 0
+            torch.save(checkpoint_payload, best_checkpoint_path)
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= args.patience:
+            print(f"Early stopping triggered at epoch {epoch + 1}, best epoch was {best_epoch}.")
+            break
+
+    save_json(
+        {
+            "history": history,
+            "best_mAP50": best_map50,
+            "best_epoch": best_epoch,
+            "effective_batch": args.effective_batch,
+            "micro_batch": args.batch_size,
+            "accum_steps": accum_steps,
+            "fair_reference": FAIR_TRAINING_DEFAULTS,
+        },
+        reports_dir / "train_history.json"
+    )
+    print(f"训练完成，最佳权重保存在: {best_checkpoint_path}")
 
 
 if __name__ == "__main__":

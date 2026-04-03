@@ -24,3 +24,17 @@
   - 放改进实验输出
 - `train_improved.py`
   - 单独的训练入口，不改现有 `src/train.py`
+
+当前已提供：
+
+- `cbam_modules.py`
+  - CBAM 模块实现
+- `patch_ultralytics_cbam.py`
+  - 运行时为 Ultralytics 注入 CBAM，不修改 site-packages
+- `model_configs/yolov8_cbam.yaml`
+  - YOLOv8 + CBAM 的实验配置
+
+运行示例：
+
+- YOLOv8 + CBAM
+  - `python experiments/yolov8_improved/train_improved.py --model experiments/yolov8_improved/model_configs/yolov8_cbam.yaml --pretrained yolov8n.pt --name yolov8_cbam_exp`
