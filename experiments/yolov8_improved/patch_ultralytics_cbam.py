@@ -16,7 +16,7 @@ import torch
 from ultralytics.nn import tasks
 from ultralytics.utils.ops import make_divisible
 
-from cbam_modules import CBAM
+from experiments.yolov8_improved.cbam_modules import CBAM
 
 
 def apply_cbam_patch():
@@ -116,7 +116,7 @@ def custom_parse_model(d, ch, verbose=True):
             if "nn." in m
             else getattr(__import__("torchvision").ops, m[16:])
             if "torchvision.ops." in m
-            else globals()[m]
+            else tasks.__dict__[m]
         )
         for j, a in enumerate(args):
             if isinstance(a, str):

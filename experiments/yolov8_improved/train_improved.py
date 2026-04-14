@@ -20,7 +20,7 @@ from pathlib import Path
 from ultralytics import YOLO
 
 from experiments.experiment_defaults import FAIR_TRAINING_DEFAULTS
-from patch_ultralytics_cbam import apply_cbam_patch
+from experiments.yolov8_improved.patch_ultralytics_cbam import apply_cbam_patch
 
 
 WORKSPACE = Path(__file__).resolve().parents[2]

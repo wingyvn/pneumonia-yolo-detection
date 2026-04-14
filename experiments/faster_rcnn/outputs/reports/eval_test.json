@@ -1,0 +1,23 @@
+{
+  "split": "test",
+  "checkpoint": "E:\\kuarkdownload\\bishe\\pneumonia_testing\\workspace\\experiments\\faster_rcnn\\outputs\\checkpoints\\best_map50.pth",
+  "mAP50": 0.9133183673122941,
+  "mAP50_95": 0.9133183673122941,
+  "per_class_AP50": {
+    "Pneumonia Bacteria": 0.9238733546811013,
+    "Pneumonia Virus": 0.9252138924498813,
+    "Sick": 0.9991944325648302,
+    "healthy": 1.0,
+    "tuberculosis": 0.7183101568656579
+  },
+  "avg_latency_sec": 0.0595534821050502,
+  "fps": 16.791629383417682,
+  "num_measured_images": 95,
+  "class_names": [
+    "Pneumonia Bacteria",
+    "Pneumonia Virus",
+    "Sick",
+    "healthy",
+    "tuberculosis"
+  ]
+}
